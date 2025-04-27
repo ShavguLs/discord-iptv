@@ -4,7 +4,6 @@ A powerful Discord bot that enables streaming IPTV channels to Discord voice cha
 
 ![Discord Bot Status](https://img.shields.io/badge/Discord-Bot-blue)
 ![Java](https://img.shields.io/badge/Java-11%2B-orange)
-![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Features
 
