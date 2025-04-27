@@ -71,8 +71,10 @@ The bot works as a bridge between IPTV sources and Discord:
 ```bash
 git clone https://github.com/yourusername/iptv-discord-bot.git
 cd iptv-discord-bot
-./gradlew build
+mvn clean package
 ```
+
+The output JAR file will be in the `target` directory.
 
 ## Troubleshooting
 
