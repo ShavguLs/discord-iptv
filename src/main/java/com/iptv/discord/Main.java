@@ -95,7 +95,7 @@ public class Main {
         }
     }
 
-    private static Properties loadConfig() {
+    protected static Properties loadConfig() {
         Properties config = new Properties();
 
         // Try to load from config.properties

@@ -5,6 +5,7 @@ import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.VoiceChannel;
+import net.dv8tion.jda.api.events.Event;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.events.session.ReadyEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
@@ -12,12 +13,20 @@ import net.dv8tion.jda.api.interactions.commands.OptionType;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.interactions.commands.build.OptionData;
 import net.dv8tion.jda.api.requests.GatewayIntent;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.FileInputStream;
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.List;
+import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -72,13 +81,15 @@ public class DiscordBot extends ListenerAdapter {
                         .addCommands(
                                 Commands.slash("start", "Start streaming an IPTV channel")
                                         .addOptions(
-                                                new OptionData(OptionType.STRING, "playlist", "URL to IPTV playlist", true),
+//                                                new OptionData(OptionType.STRING, "playlist", "URL to IPTV playlist", true),
                                                 new OptionData(OptionType.STRING, "channel", "Channel name to stream", true)),
                                 Commands.slash("stop", "Stop the current IPTV stream"),
                                 Commands.slash("list", "List available channels in the playlist")
                                         .addOptions(
                                                 new OptionData(OptionType.STRING, "playlist", "URL to IPTV playlist", true)),
-                                Commands.slash("cleanup", "Clean up all old sources from OBS")
+                                Commands.slash("cleanup", "Clean up all old sources from OBS"),
+                                Commands.slash("streaminfo", "Display information about the current stream"),
+                                Commands.slash("ping", "Test command to test bot respond")
                         ).queue();
 
                 LOGGER.info("Registered commands for guild: " + guild.getName());
@@ -122,9 +133,203 @@ public class DiscordBot extends ListenerAdapter {
             case "cleanup":
                 handleCleanupCommand(event);
                 break;
+            case "ping":
+                handlePingCommand(event);
+                break;
+            case "streaminfo"   :
+                handleStreamInfoCommand(event);
+                break;
             default:
                 event.reply("Unknown command: " + command).setEphemeral(true).queue();
                 break;
+        }
+    }
+
+    private void handleStreamInfoCommand(SlashCommandInteractionEvent event) {
+        String guildId = event.getGuild().getId();
+
+        if (!activeStreams.containsKey(guildId)){
+            event.reply("There is no active stream. Start one with `/start`.");
+            return;
+        }
+
+        StreamInfo streamInfo = activeStreams.get(guildId);
+
+        // Defer reply to allow for data collection
+        event.deferReply().queue();
+
+        try {
+            String streamUrl = streamInfo.streamUrl;
+            String channelName = streamInfo.channelName;
+
+            boolean isStreamActive = ffmpegController.isRunning();
+
+            Map<String, String> streamMetadata = collectStreamMetadata(streamUrl);
+
+            StringBuilder infoBuilder = new StringBuilder();
+            infoBuilder.append("📺 **TV Stream Information**\n\n");
+            infoBuilder.append("**Channel:** ").append(channelName).append("\n");
+            infoBuilder.append("**Stream Status:** ").append(isStreamActive ? "✅ Active" : "❌ Inactive").append("\n");
+            infoBuilder.append("**Started At:** <t:").append(streamInfo.startTime / 1000).append(":f>\n");
+            infoBuilder.append("**Uptime:** ").append(formatUptime(System.currentTimeMillis() - streamInfo.startTime)).append("\n");
+
+            if (!streamMetadata.isEmpty()){
+                infoBuilder.append("\n**Stream Details:**\n");
+
+                // Add video info if it is available
+                if (streamMetadata.containsKey("resolution")){
+                    infoBuilder.append("📹 **Video:** ").append(streamMetadata.get("resolution"));
+                    if (streamMetadata.containsKey("video_bitrate")) {
+                        infoBuilder.append(" at ").append(streamMetadata.get("video_bitrate"));
+                    }
+                    infoBuilder.append("\n");
+                }
+
+                // Add audio info if it is available
+                if (streamMetadata.containsKey("audio_codec")) {
+                    infoBuilder.append("🔊 **Audio:** ").append(streamMetadata.get("audio_codec"));
+                    if (streamMetadata.containsKey("audio_bitrate")) {
+                        infoBuilder.append(" at ").append(streamMetadata.get("audio_bitrate"));
+                    }
+                    infoBuilder.append("\n");
+                }
+
+                // Reply with the stream information
+                event.getHook().sendMessage(infoBuilder.toString()).queue();
+            }
+        }catch (Exception e){
+            LOGGER.log(Level.SEVERE, "Error getting stream info", e);
+            event.getHook().sendMessage("Error retrieving stream info: " + e.getMessage()).queue();
+        }
+    }
+
+    private String formatUptime(long milliseconds) {
+        long seconds = milliseconds / 1000;
+        long minutes = seconds / 60;
+        long hours = minutes / 60;
+
+        return String.format("%02d:%02d:%02d", hours, minutes % 60, seconds % 60);
+    }
+
+    private Map<String, String> collectStreamMetadata(String streamUrl) {
+        Map<String, String> metadata = new HashMap<>();
+
+        try {
+            LOGGER.info("Collecting metadata for stream URL: " + streamUrl);
+
+            // Run FFprobe to get stream information
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_format",
+                    "-show_streams",
+                    "-print_format", "json",
+                    streamUrl
+            );
+
+            LOGGER.info("Running command: " + String.join(" ", processBuilder.command()));
+
+            // Set a shorter timeout for probe
+            processBuilder.redirectErrorStream(true);
+            Process process = processBuilder.start();
+
+            // Only wait a few seconds to avoid blocking the bot
+            if (process.waitFor(5, TimeUnit.SECONDS)) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    StringBuilder output = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        output.append(line);
+                    }
+
+                    String jsonOutput = output.toString();
+                    LOGGER.fine("FFprobe output: " + jsonOutput);
+
+                    if (jsonOutput.isEmpty()) {
+                        LOGGER.warning("Empty output from FFprobe");
+                        return metadata;
+                    }
+
+                    // Parse the JSON output
+                    JSONObject json = new JSONObject(jsonOutput);
+
+                    // Get stream information from the JSON
+                    if (json.has("streams") && json.getJSONArray("streams").length() > 0) {
+                        JSONArray streams = json.getJSONArray("streams");
+                        LOGGER.info("Found " + streams.length() + " streams");
+
+                        // Process video and audio streams
+                        for (int i = 0; i < streams.length(); i++) {
+                            JSONObject stream = streams.getJSONObject(i);
+                            String codecType = stream.getString("codec_type");
+
+                            LOGGER.fine("Processing stream " + i + " of type: " + codecType);
+
+                            if ("video".equals(codecType)) {
+                                if (stream.has("width") && stream.has("height")) {
+                                    int width = stream.getInt("width");
+                                    int height = stream.getInt("height"); // Fixed property name
+                                    metadata.put("resolution", width + "x" + height);
+                                    LOGGER.fine("Found resolution: " + width + "x" + height);
+                                }
+
+                                if (stream.has("bit_rate")) {
+                                    int bitrate = stream.getInt("bit_rate") / 1000;
+                                    metadata.put("video_bitrate", bitrate + " Kbps");
+                                    LOGGER.fine("Found video bitrate: " + bitrate + " Kbps");
+                                }
+
+                                if (stream.has("codec_name")) {
+                                    metadata.put("video_codec", stream.getString("codec_name"));
+                                    LOGGER.fine("Found video codec: " + stream.getString("codec_name"));
+                                }
+                            } else if ("audio".equals(codecType)) {
+                                if (stream.has("codec_name")) {
+                                    metadata.put("audio_codec", stream.getString("codec_name"));
+                                    LOGGER.fine("Found audio codec: " + stream.getString("codec_name"));
+                                }
+
+                                if (stream.has("bit_rate")) {
+                                    int bitrate = stream.getInt("bit_rate") / 1000;
+                                    metadata.put("audio_bitrate", bitrate + " Kbps");
+                                    LOGGER.fine("Found audio bitrate: " + bitrate + " Kbps");
+                                }
+                            }
+                        }
+                    } else {
+                        LOGGER.warning("No streams found in the FFprobe output");
+                    }
+
+                    // Get format information
+                    if (json.has("format")) {
+                        JSONObject format = json.getJSONObject("format");
+
+                        if (format.has("bit_rate")) {
+                            int totalBitrate = format.getInt("bit_rate") / 1000;
+                            metadata.put("total_bitrate", totalBitrate + " Kbps");
+                            LOGGER.fine("Found total bitrate: " + totalBitrate + " Kbps");
+                        }
+                    }
+                }
+            } else {
+                // Process didn't finish in time, kill it
+                process.destroyForcibly();
+                LOGGER.warning("FFprobe timeout while collecting stream metadata");
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error collecting stream metadata", e);
+            e.printStackTrace(); // Add this to get more details about the error
+        }
+
+        LOGGER.info("Collected metadata: " + metadata);
+        return metadata;
+    }
+
+    private void handlePingCommand(SlashCommandInteractionEvent event){
+        try {
+            event.reply("Pong").queue();
+        }catch (Exception e){
+            event.reply("Something went wrong!").queue();
         }
     }
 
@@ -132,7 +337,10 @@ public class DiscordBot extends ListenerAdapter {
         // Defer reply to allow for longer processing time
         event.deferReply().queue();
 
-        String playlistUrl = event.getOption("playlist").getAsString();
+        Properties config = Main.loadConfig();
+
+//        String playlistUrl = event.getOption("playlist").getAsString();
+        String playlistUrl = config.getProperty("playlist.url");
         String channelName = event.getOption("channel").getAsString();
         String guildId = event.getGuild().getId();
 
@@ -331,12 +539,14 @@ public class DiscordBot extends ListenerAdapter {
         final String channelName;
         final String streamUrl;
         final String channelId;
+        final long startTime;
 
         public StreamInfo(String playlistUrl, String channelName, String streamUrl, String channelId) {
             this.playlistUrl = playlistUrl;
             this.channelName = channelName;
             this.streamUrl = streamUrl;
             this.channelId = channelId;
+            this.startTime = System.currentTimeMillis();
         }
     }
 }
