@@ -5,6 +5,7 @@ import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.entities.Guild;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.VoiceChannel;
+import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.events.Event;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.events.session.ReadyEvent;
@@ -24,9 +25,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -81,14 +80,14 @@ public class DiscordBot extends ListenerAdapter {
                         .addCommands(
                                 Commands.slash("start", "Start streaming an IPTV channel")
                                         .addOptions(
-//                                                new OptionData(OptionType.STRING, "playlist", "URL to IPTV playlist", true),
                                                 new OptionData(OptionType.STRING, "channel", "Channel name to stream", true)),
                                 Commands.slash("stop", "Stop the current IPTV stream"),
                                 Commands.slash("list", "List available channels in the playlist")
                                         .addOptions(
-                                                new OptionData(OptionType.STRING, "playlist", "URL to IPTV playlist", true)),
+                                                new OptionData(OptionType.STRING, "playlist", "URL to IPTV playlist", false)),
                                 Commands.slash("cleanup", "Clean up all old sources from OBS"),
                                 Commands.slash("streaminfo", "Display information about the current stream"),
+                                Commands.slash("healthcheck", "Check stream health and connection status"),
                                 Commands.slash("ping", "Test command to test bot respond")
                         ).queue();
 
@@ -136,8 +135,11 @@ public class DiscordBot extends ListenerAdapter {
             case "ping":
                 handlePingCommand(event);
                 break;
-            case "streaminfo"   :
+            case "streaminfo":
                 handleStreamInfoCommand(event);
+                break;
+            case "healthcheck":
+                handleHealthCheckCommand(event);
                 break;
             default:
                 event.reply("Unknown command: " + command).setEphemeral(true).queue();
@@ -339,26 +341,26 @@ public class DiscordBot extends ListenerAdapter {
 
         Properties config = Main.loadConfig();
 
-//        String playlistUrl = event.getOption("playlist").getAsString();
         String playlistUrl = config.getProperty("playlist.url");
         String channelName = event.getOption("channel").getAsString();
         String guildId = event.getGuild().getId();
 
         // Check if we already have an active stream for this guild
         if (activeStreams.containsKey(guildId)) {
-            event.getHook().sendMessage("A stream is already active in this server. Stop it first with /stop").queue();
+            event.getHook().sendMessage("A stream is already active in this server. Stop it first with `/stop`").queue();
             return;
         }
 
         try {
-            // Parse the playlist
+            // Parse the playlist - will use cached playlist if recently parsed
             iptvParser.parsePlaylistFromUrl(playlistUrl);
 
             // Find the channel
             String streamUrl = iptvParser.getStreamUrl(channelName);
 
             if (streamUrl == null) {
-                event.getHook().sendMessage("Channel not found: " + channelName).queue();
+                event.getHook().sendMessage("Channel not found: `" + channelName +
+                        "`\n\nUse `/list` to see available channels.").queue();
                 return;
             }
 
@@ -367,27 +369,81 @@ public class DiscordBot extends ListenerAdapter {
 
             // Start FFmpeg to capture the stream and send it to local UDP
             if (!ffmpegController.startStreaming(streamUrl, localStreamUrl)) {
-                event.getHook().sendMessage("Failed to start FFmpeg streaming").queue();
-                return;
+                // Try a fallback URL if available
+                LOGGER.info("Primary stream failed, attempting fallback");
+                String fallbackUrl = iptvParser.getFallbackStreamUrl(channelName);
+
+                if (fallbackUrl != null && !fallbackUrl.equals(streamUrl)) {
+                    LOGGER.info("Using fallback URL: " + fallbackUrl);
+
+                    // Inform the user we're trying a fallback
+                    event.getHook().sendMessage("Primary stream source failed, trying backup source...").queue();
+
+                    if (!ffmpegController.startStreaming(fallbackUrl, localStreamUrl)) {
+                        // Enhanced error reporting
+                        handleStreamFailure(event, channelName, ffmpegController.getLastErrorMessage());
+                        // Mark the channel as problematic
+                        iptvParser.markStreamAsFailed(channelName);
+                        return;
+                    }
+
+                    // Update the stream URL to the fallback that worked
+                    streamUrl = fallbackUrl;
+                } else {
+                    // No fallback available or fallback is the same URL
+                    handleStreamFailure(event, channelName, ffmpegController.getLastErrorMessage());
+                    iptvParser.markStreamAsFailed(channelName);
+                    return;
+                }
             }
 
             // Configure OBS to display the stream
             if (!obsController.setupStream(localStreamUrl, channelName)) {
                 ffmpegController.stopStreaming();
-                event.getHook().sendMessage("Failed to configure OBS").queue();
+                event.getHook().sendMessage("Failed to configure OBS. Please ensure OBS is running with WebSocket plugin enabled.").queue();
                 return;
             }
 
-            // Store active stream info
+            // Store active stream info with enhanced details
             StreamInfo streamInfo = new StreamInfo(playlistUrl, channelName, streamUrl, event.getChannel().getId());
             activeStreams.put(guildId, streamInfo);
 
-            // Success message with instructions
-            event.getHook().sendMessage("IPTV Stream started for channel: " + channelName + "\n\n" +
-                    "**How to view the stream:**\n" +
-                    "1. Join a voice channel\n" +
-                    "2. Share your screen and select OBS Virtual Camera\n" +
-                    "3. Everyone in the voice channel will see the stream").queue();
+            // Get additional channel info if available
+            String channelGroup = iptvParser.getChannelGroup(channelName);
+            List<String> similarChannels = iptvParser.getSimilarChannels(channelName);
+
+            // Build success message with additional information
+            StringBuilder successMessage = new StringBuilder();
+            successMessage.append("📺 **IPTV Stream started**\n\n");
+            successMessage.append("**Channel:** ").append(channelName).append("\n");
+
+            if (channelGroup != null && !channelGroup.isEmpty()) {
+                successMessage.append("**Category:** ").append(channelGroup).append("\n");
+            }
+
+            successMessage.append("\n**How to view the stream:**\n");
+            successMessage.append("1. Join a voice channel\n");
+            successMessage.append("2. Share your screen and select OBS Virtual Camera\n");
+            successMessage.append("3. Everyone in the voice channel will see the stream\n\n");
+
+            // Add similar channels if available
+            if (!similarChannels.isEmpty()) {
+                successMessage.append("**Similar channels in this category:**\n");
+                int count = 0;
+                for (String similar : similarChannels) {
+                    successMessage.append("• `").append(similar).append("`\n");
+                    count++;
+                    if (count >= 5) break; // Limit to 5 suggestions
+                }
+                successMessage.append("\n");
+            }
+
+            successMessage.append("Use `/stop` to end the stream, or `/streaminfo` for details.");
+
+            event.getHook().sendMessage(successMessage.toString()).queue();
+
+            // Start monitoring thread for this stream
+            startStreamMonitoring(guildId, event.getChannel());
 
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Error parsing playlist", e);
@@ -398,6 +454,100 @@ public class DiscordBot extends ListenerAdapter {
 
             // Cleanup
             ffmpegController.stopStreaming();
+        }
+    }
+
+    private final Map<String, ScheduledExecutorService> streamMonitors = new ConcurrentHashMap<>();
+
+    private void startStreamMonitoring(String guildId, MessageChannel channel) {
+        // Stop any existing monitor for this guild
+        stopStreamMonitoring(guildId);
+
+        // Create a new scheduled executor
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        streamMonitors.put(guildId, executor);
+
+        // Schedule regular checks
+        executor.scheduleAtFixedRate(() -> {
+            try {
+                // Only proceed if we still have an active stream for this guild
+                if (!activeStreams.containsKey(guildId)) {
+                    stopStreamMonitoring(guildId);
+                    return;
+                }
+
+                StreamInfo streamInfo = activeStreams.get(guildId);
+
+                // Check if FFmpeg is still running
+                if (!ffmpegController.isRunning()) {
+                    // Stream has died
+                    if (ffmpegController.hasCriticalError()) {
+                        // Critical error - notify and stop the stream
+                        String errorMessage = "⚠️ **Stream Error**\n\n" +
+                                "The stream for channel **" + streamInfo.channelName + "** has stopped due to a critical error: " +
+                                ffmpegController.getLastErrorMessage() + "\n\n" +
+                                "The stream has been stopped. Try a different channel or try again later.";
+
+                        channel.sendMessage(errorMessage).queue();
+
+                        // Clean up this stream
+                        handleCleanStreamStop(guildId);
+                    } else if (ffmpegController.getLastErrorType() != FFmpegController.ErrorType.NONE) {
+                        // Non-critical error - just notify
+                        String warningMessage = "⚠️ **Stream Warning**\n\n" +
+                                "The stream for channel **" + streamInfo.channelName + "** is experiencing issues: " +
+                                ffmpegController.getLastErrorMessage() + "\n\n" +
+                                "Attempting to recover automatically...";
+
+                        channel.sendMessage(warningMessage).queue();
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error in stream monitoring", e);
+            }
+        }, 30, 30, TimeUnit.SECONDS); // Check every 30 seconds
+    }
+
+    private void stopStreamMonitoring(String guildId) {
+        ScheduledExecutorService executor = streamMonitors.remove(guildId);
+        if (executor != null) {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    private void handleCleanStreamStop(String guildId) {
+        // Stop monitoring
+        stopStreamMonitoring(guildId);
+
+        // Only proceed if we have an active stream for this guild
+        if (!activeStreams.containsKey(guildId)) {
+            return;
+        }
+
+        // Get stream info before removing it
+        StreamInfo streamInfo = activeStreams.get(guildId);
+
+        // Stop FFmpeg
+        ffmpegController.stopStreaming();
+
+        // Remove from tracking
+        activeStreams.remove(guildId);
+
+        // Clean up OBS sources
+        try {
+            String safeName = streamInfo.channelName.replaceAll("[^a-zA-Z0-9]", "_");
+            String sourceName = "IPTV-Source-" + safeName;
+            obsController.cleanupSources(sourceName);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error cleaning up OBS sources", e);
         }
     }
 
@@ -518,6 +668,11 @@ public class DiscordBot extends ListenerAdapter {
     }
 
     public void shutdown() {
+        // Stop all stream monitoring
+        for (String guildId : new ArrayList<>(streamMonitors.keySet())) {
+            stopStreamMonitoring(guildId);
+        }
+
         // Stop all active streams
         for (StreamInfo streamInfo : activeStreams.values()) {
             ffmpegController.stopStreaming();
@@ -530,8 +685,45 @@ public class DiscordBot extends ListenerAdapter {
         // Shutdown FFmpeg controller
         ffmpegController.shutdown();
 
+        // Shutdown the IPTV parser
+        iptvParser.shutdown();
+
         // Shutdown JDA
         jda.shutdown();
+    }
+
+    private void handleHealthCheckCommand(SlashCommandInteractionEvent event) {
+        String guildId = event.getGuild().getId();
+
+        if (!activeStreams.containsKey(guildId)) {
+            event.reply("No active stream to check").setEphemeral(true).queue();
+            return;
+        }
+
+        StreamInfo streamInfo = activeStreams.get(guildId);
+        boolean isStreamRunning = ffmpegController.isRunning();
+
+        StringBuilder healthReport = new StringBuilder();
+        healthReport.append("📊 **Stream Health Report**\n\n");
+        healthReport.append("**Channel:** ").append(streamInfo.channelName).append("\n");
+        healthReport.append("**Status:** ");
+
+        if (isStreamRunning) {
+            healthReport.append("✅ Running\n");
+            healthReport.append("**Uptime:** ").append(formatUptime(System.currentTimeMillis() - streamInfo.startTime)).append("\n");
+        } else {
+            healthReport.append("❌ Not running\n");
+            healthReport.append("**Last Error:** ").append(ffmpegController.getLastErrorType()).append("\n");
+            healthReport.append("**Error Details:** ").append(ffmpegController.getLastErrorMessage()).append("\n");
+        }
+
+        // Add error statistics if there have been issues
+        if (ffmpegController.getLastErrorType() != FFmpegController.ErrorType.NONE) {
+            healthReport.append("\n**Error Summary:**\n");
+            healthReport.append(ffmpegController.getErrorSummary()).append("\n");
+        }
+
+        event.reply(healthReport.toString()).queue();
     }
 
     private static class StreamInfo {
@@ -548,5 +740,56 @@ public class DiscordBot extends ListenerAdapter {
             this.channelId = channelId;
             this.startTime = System.currentTimeMillis();
         }
+    }
+
+    private void handleStreamFailure(SlashCommandInteractionEvent event, String channelName, String errorMessage) {
+        // Enhanced error reporting method
+        StringBuilder errorResponse = new StringBuilder();
+        errorResponse.append("❌ **Stream Error**\n\n");
+        errorResponse.append("Failed to start stream for channel: **").append(channelName).append("**\n\n");
+
+        // Add specific error information
+        if (errorMessage != null && !errorMessage.isEmpty()) {
+            errorResponse.append("**Error details:**\n");
+            errorResponse.append("`").append(errorMessage).append("`\n\n");
+        }
+
+        // Add troubleshooting suggestions based on error type
+        if (ffmpegController.getLastErrorType() != null) {
+            errorResponse.append("**Troubleshooting suggestions:**\n");
+
+            switch (ffmpegController.getLastErrorType()) {
+                case CONNECTION_REFUSED:
+                    errorResponse.append("• The stream server appears to be offline or rejecting connections\n");
+                    errorResponse.append("• Try again later when the server might be available\n");
+                    break;
+                case CONNECTION_TIMEOUT:
+                    errorResponse.append("• The stream server is not responding in time\n");
+                    errorResponse.append("• This could be due to network congestion or server issues\n");
+                    errorResponse.append("• Try again in a few minutes\n");
+                    break;
+                case SERVER_ERROR:
+                    errorResponse.append("• The stream server reported an error\n");
+                    errorResponse.append("• The channel may be temporarily unavailable\n");
+                    errorResponse.append("• Try again later or try a different channel\n");
+                    break;
+                case INVALID_DATA:
+                    errorResponse.append("• Received corrupt or invalid stream data\n");
+                    errorResponse.append("• The channel may be broadcasting incorrectly\n");
+                    errorResponse.append("• Try a different channel\n");
+                    break;
+                case STREAM_STALLED:
+                    errorResponse.append("• The stream started but then stopped sending data\n");
+                    errorResponse.append("• This could be due to network issues or server problems\n");
+                    errorResponse.append("• Try again or try a different channel\n");
+                    break;
+                default:
+                    errorResponse.append("• Try again later or try a different channel\n");
+                    errorResponse.append("• Check if the IPTV service is working properly\n");
+            }
+        }
+
+        // Send the response
+        event.getHook().sendMessage(errorResponse.toString()).queue();
     }
 }
