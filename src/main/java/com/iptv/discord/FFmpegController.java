@@ -3,6 +3,7 @@ package com.iptv.discord;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.DatagramSocket;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -450,6 +451,236 @@ public class FFmpegController {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             watchdog.shutdownNow();
+        }
+    }
+
+    /**
+     * Start streaming with custom quality options
+     * @param streamUrl The source stream URL
+     * @param outputUrl The destination stream URL (usually UDP)
+     * @param qualityOptions FFmpeg options to control quality
+     * @return True if started successfully
+     */
+    public boolean startStreamingWithQuality(String streamUrl, String outputUrl, String qualityOptions) {
+        if (isRunning) {
+            LOGGER.info("FFmpeg is already running. Stopping current stream first.");
+            stopStreaming();
+        }
+
+        this.streamUrl = streamUrl;
+        this.outputUrl = outputUrl;
+        resetErrorState();
+
+        return startFFmpegProcessWithOptions(qualityOptions);
+    }
+
+    private boolean startFFmpegProcessWithOptions(String qualityOptions) {
+        List<String> command = buildFFmpegCommandWithQuality(qualityOptions);
+
+        try {
+            ProcessBuilder processBuilder = new ProcessBuilder(command);
+            processBuilder.redirectErrorStream(true);
+
+            LOGGER.info("Starting FFmpeg with command: " + String.join(" ", command));
+            ffmpegProcess = processBuilder.start();
+
+            // Start a thread to read and log the FFmpeg output
+            new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(ffmpegProcess.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        processFFmpegOutput(line);
+                    }
+                } catch (IOException e) {
+                    LOGGER.log(Level.SEVERE, "Error reading FFmpeg output", e);
+                }
+            }).start();
+
+            // Set up watchdog to monitor the FFmpeg process
+            setupWatchdog();
+
+            isRunning = true;
+            lastProgressUpdate = System.currentTimeMillis();
+            return true;
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "Failed to start FFmpeg", e);
+            lastErrorType = ErrorType.UNKNOWN;
+            lastErrorMessage = e.getMessage();
+            return false;
+        }
+    }
+
+    private List<String> buildFFmpegCommandWithQuality(String qualityOptions) {
+        List<String> command = new ArrayList<>();
+
+        command.add("ffmpeg");
+
+        // Input options for faster stream analysis
+        command.add("-probesize");
+        command.add("42M");
+        command.add("-analyzeduration");
+        command.add("3M");
+
+        // Input URL
+        command.add("-i");
+        command.add(streamUrl);
+
+        // Enhanced reconnect options
+        command.add("-reconnect");
+        command.add("1");
+        command.add("-reconnect_at_eof");
+        command.add("1");
+        command.add("-reconnect_streamed");
+        command.add("1");
+        command.add("-reconnect_delay_max");
+        command.add("30");
+
+        // Error handling options
+        command.add("-err_detect");
+        command.add("ignore_err");
+
+        // Add custom quality options if provided
+        if (qualityOptions != null && !qualityOptions.isEmpty()) {
+            // Parse and add each option
+            String[] options = qualityOptions.split(" ");
+            for (String option : options) {
+                if (!option.trim().isEmpty()) {
+                    command.add(option.trim());
+                }
+            }
+        } else {
+            // Default options when no quality specified
+            // Just copy codecs without re-encoding
+            command.add("-vcodec");
+            command.add("copy");
+            command.add("-acodec");
+            command.add("copy");
+        }
+
+        // Format
+        command.add("-f");
+        command.add("mpegts");
+
+        // Output options
+        if (outputUrl.startsWith("udp://")) {
+            // UDP-specific options
+            command.add("-bufsize");
+            command.add("5000k");
+            command.add("-flush_packets");
+            command.add("1");
+        }
+
+        // Output URL
+        command.add(outputUrl);
+
+        return command;
+    }
+
+    /**
+     * Improved FFmpeg controller method for smoother quality transitions
+     */
+    public boolean switchQualityWithoutRestart(String streamUrl, String outputUrl, String qualityOptions) {
+        try {
+            // Create a new FFmpeg process with the new quality settings
+            List<String> command = buildFFmpegCommandWithQuality(qualityOptions);
+            ProcessBuilder processBuilder = new ProcessBuilder(command);
+            processBuilder.redirectErrorStream(true);
+
+            LOGGER.info("Starting new FFmpeg process with updated quality: " + String.join(" ", command));
+
+            Process newProcess = processBuilder.start();
+
+            // Start a thread to monitor the new process
+            new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(newProcess.getInputStream()))) {
+                    String line;
+                    boolean startedSuccessfully = false;
+                    int linesRead = 0;
+
+                    // Read a few lines to see if the process started successfully
+                    while ((line = reader.readLine()) != null && linesRead < 20) {
+                        processFFmpegOutput(line);
+                        linesRead++;
+
+                        if (line.contains("Output #0") || line.contains("frame=")) {
+                            startedSuccessfully = true;
+                            break;
+                        }
+                    }
+
+                    if (startedSuccessfully) {
+                        LOGGER.info("New FFmpeg process started successfully, switching...");
+
+                        // Store reference to old process
+                        Process oldProcess = ffmpegProcess;
+
+                        // Update process reference
+                        ffmpegProcess = newProcess;
+
+                        // Allow a small overlap to prevent stream interruption
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+
+                        // Terminate old process gracefully
+                        if (oldProcess != null && oldProcess.isAlive()) {
+                            oldProcess.destroy();
+                            try {
+                                if (!oldProcess.waitFor(5, TimeUnit.SECONDS)) {
+                                    oldProcess.destroyForcibly();
+                                }
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                oldProcess.destroyForcibly();
+                            }
+                        }
+
+                        // Continue reading output from new process
+                        while ((line = reader.readLine()) != null) {
+                            processFFmpegOutput(line);
+                        }
+                    } else {
+                        LOGGER.warning("New FFmpeg process failed to start properly");
+                        newProcess.destroy();
+                    }
+                } catch (IOException e) {
+                    LOGGER.log(Level.SEVERE, "Error reading new FFmpeg process output", e);
+                }
+            }).start();
+
+            return true;
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Error switching quality", e);
+            return false;
+        }
+    }
+
+    public void cleanupAllProcesses() {
+        stopStreaming();
+
+        // Find and kill any orphaned FFmpeg processes
+        try {
+            String os = System.getProperty("os.name").toLowerCase();
+            if (os.contains("win")) {
+                Runtime.getRuntime().exec("taskkill /F /IM ffmpeg.exe");
+            } else {
+                Runtime.getRuntime().exec("pkill -9 ffmpeg");
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to clean up FFmpeg processes", e);
+        }
+    }
+
+    private int findAvailableUdpPort() {
+        try (DatagramSocket socket = new DatagramSocket(0)) {
+            return socket.getLocalPort();
+        } catch (Exception e) {
+            LOGGER.warning("Error finding available UDP port: " + e.getMessage());
+            return 1234; // Default fallback
         }
     }
 }

@@ -1,30 +1,24 @@
 package com.iptv.discord;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.io.InputStream;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.net.SocketTimeoutException;
-import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 public class RedirectIPTVParser {
     private static final Logger LOGGER = Logger.getLogger(RedirectIPTVParser.class.getName());
@@ -73,6 +67,12 @@ public class RedirectIPTVParser {
     private String playlistContent;
     private long lastPlaylistRefreshTime = 0;
     private static final long PLAYLIST_REFRESH_INTERVAL = 3600000; // 1 hour in milliseconds
+
+    private final Map<String, List<String>> searchResultsCache = new ConcurrentHashMap<>();
+    private final Map<String, Long> searchCacheTimestamps = new ConcurrentHashMap<>();
+    private static final long SEARCH_CACHE_TTL = 300000;
+
+    private final Map<String, Long> cacheTimestamps = new ConcurrentHashMap<>();
 
     public void parsePlaylistFromUrl(String playlistUrl) throws IOException {
         LOGGER.info("Parsing playlist from URL: " + playlistUrl);
@@ -334,115 +334,104 @@ public class RedirectIPTVParser {
             return;
         }
 
-        // Check for HTML content which indicates an error or redirect issue
+        // Fast check for content validity
         if (playlistContent.trim().startsWith("<html") || playlistContent.trim().startsWith("<!DOCTYPE")) {
             LOGGER.severe("Received HTML content instead of M3U/M3U8 playlist. Possible access issue or wrong URL.");
             return;
         }
 
-        // Check if valid format with flexibility
-        boolean hasValidHeader = playlistContent.trim().startsWith(EXTM3U_HEADER);
-        if (!hasValidHeader) {
-            LOGGER.warning("Warning: Playlist doesn't start with #EXTM3U header - may be non-standard format");
-        }
+        // Measure parsing performance
+        long startTime = System.currentTimeMillis();
 
         // Clear previous data
         channelUrlsMap.clear();
         primaryChannelUrlMap.clear();
         channelGroupMap.clear();
+        verifiedUrlCache.clear();
 
-        String[] lines = playlistContent.split("\n");
+        // Use BufferedReader for more efficient line-by-line processing
+        try (BufferedReader reader = new BufferedReader(new StringReader(playlistContent))) {
+            String line;
+            String currentChannelName = null;
+            String currentGroupTitle = null;
+            StringBuilder extinfLine = new StringBuilder();
+            boolean processingExtinf = false;
+            int lineCount = 0;
+            int channelCount = 0;
 
-        LOGGER.info("Parsing " + lines.length + " lines from playlist");
+            while ((line = reader.readLine()) != null) {
+                lineCount++;
+                line = line.trim();
+                if (line.isEmpty()) continue;
 
-        String currentChannelName = null;
-        String currentGroupTitle = null;
-        StringBuilder extinfLine = new StringBuilder();
-        boolean processingExtinf = false;
+                // Process EXTINF lines
+                if (line.startsWith(EXTINF_PREFIX)) {
+                    extinfLine = new StringBuilder(line);
+                    processingExtinf = true;
 
-        // Process each line
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i].trim();
+                    // Extract information
+                    currentChannelName = extractChannelName(line);
+                    currentGroupTitle = extractGroupTitle(line);
 
-            if (line.isEmpty()) continue;
-
-            // Process EXTINF lines
-            if (line.startsWith(EXTINF_PREFIX)) {
-                extinfLine = new StringBuilder(line);
-                processingExtinf = true;
-
-                // Try to extract channel name
-                currentChannelName = extractChannelName(line);
-
-                // Try to extract group title
-                currentGroupTitle = extractGroupTitle(line);
-
-                LOGGER.fine("Found EXTINF at line " + i + ": Name=" + currentChannelName +
-                        ", Group=" + currentGroupTitle);
-            }
-            // Handle multi-line EXTINF (some playlists format this way)
-            else if (processingExtinf && line.startsWith("#") && !line.startsWith(EXTVLCOPT_PREFIX) &&
-                    !line.startsWith(KODIPROP_PREFIX)) {
-                extinfLine.append(" ").append(line);
-
-                // Re-extract after appending
-                currentChannelName = extractChannelName(extinfLine.toString());
-                currentGroupTitle = extractGroupTitle(extinfLine.toString());
-            }
-            // Handle URL lines
-            else if (isValidStreamUrl(line)) {
-                processingExtinf = false;
-
-                if (currentChannelName == null || currentChannelName.isEmpty()) {
-                    // Try to derive name from URL if not available
-                    currentChannelName = "Channel-" + (channelUrlsMap.size() + 1);
+                    if (lineCount % 5000 == 0) {
+                        LOGGER.info("Parsing progress: " + lineCount + " lines...");
+                    }
                 }
+                // Handle multi-line EXTINF (some playlists format this way)
+                else if (processingExtinf && line.startsWith("#") && !line.startsWith(EXTVLCOPT_PREFIX) &&
+                        !line.startsWith(KODIPROP_PREFIX)) {
+                    extinfLine.append(" ").append(line);
 
-                // Add to channel maps
-                String normalizedName = currentChannelName.toLowerCase();
-
-                // Store the group if available
-                if (currentGroupTitle != null && !currentGroupTitle.isEmpty()) {
-                    channelGroupMap.put(normalizedName, currentGroupTitle);
+                    // Re-extract after appending
+                    currentChannelName = extractChannelName(extinfLine.toString());
+                    currentGroupTitle = extractGroupTitle(extinfLine.toString());
                 }
+                // Handle URL lines
+                else if (isValidStreamUrl(line)) {
+                    processingExtinf = false;
 
-                // Store the URL with fallback support
-                List<String> urls = channelUrlsMap.computeIfAbsent(normalizedName, k -> new ArrayList<>());
-                urls.add(line);
+                    if (currentChannelName == null || currentChannelName.isEmpty()) {
+                        // Try to derive name from URL if not available
+                        currentChannelName = "Channel-" + (channelUrlsMap.size() + 1);
+                    }
 
-                // Also store as primary URL if it's the first one
-                if (!primaryChannelUrlMap.containsKey(normalizedName)) {
-                    primaryChannelUrlMap.put(normalizedName, line);
+                    // Add to channel maps
+                    String normalizedName = currentChannelName.toLowerCase();
+
+                    // Store the group if available
+                    if (currentGroupTitle != null && !currentGroupTitle.isEmpty()) {
+                        channelGroupMap.put(normalizedName, currentGroupTitle);
+                    }
+
+                    // Store the URL with fallback support
+                    List<String> urls = channelUrlsMap.computeIfAbsent(normalizedName, k -> new ArrayList<>(2)); // Most channels only have 1-2 URLs
+                    urls.add(line);
+
+                    // Also store as primary URL if it's the first one
+                    if (!primaryChannelUrlMap.containsKey(normalizedName)) {
+                        primaryChannelUrlMap.put(normalizedName, line);
+                        channelCount++;
+
+                        if (channelCount % 1000 == 0) {
+                            LOGGER.info("Found " + channelCount + " channels so far...");
+                        }
+                    }
+
+                    // Reset for next channel
+                    currentChannelName = null;
+                    currentGroupTitle = null;
                 }
-
-                LOGGER.fine("Added channel at line " + i + ": " + currentChannelName);
-
-                // Reset for next channel
-                currentChannelName = null;
-                currentGroupTitle = null;
             }
-            // Handle additional properties (might be used by some players)
-            else if (line.startsWith(EXTVLCOPT_PREFIX) || line.startsWith(KODIPROP_PREFIX)) {
-                // Skip these lines for now, could store them as metadata if needed
-                continue;
-            }
+
+            long endTime = System.currentTimeMillis();
+
+            LOGGER.info("Parsing complete. Found " + primaryChannelUrlMap.size() +
+                    " channels in " + (endTime - startTime) + "ms");
+            clearSearchCache();
+            asyncPreVerifyPopularChannels();
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Error parsing playlist content", e);
         }
-
-        LOGGER.info("Parsing complete. Found " + primaryChannelUrlMap.size() + " channels.");
-
-        // Log a few channel names for debugging if available
-        if (!primaryChannelUrlMap.isEmpty()) {
-            LOGGER.info("Sample channel names:");
-            int count = 0;
-            for (String name : primaryChannelUrlMap.keySet()) {
-                LOGGER.info(" - " + name);
-                count++;
-                if (count >= 5) break;
-            }
-        }
-
-        // Pre-verify some common channels to improve startup time
-        preVerifyPopularChannels();
     }
 
     /**
@@ -627,6 +616,7 @@ public class RedirectIPTVParser {
         if (!url.startsWith("http")) {
             // Assume it works
             verifiedUrlCache.put(url, true);
+            cacheTimestamps.put(url, System.currentTimeMillis());
             return true;
         }
 
@@ -659,8 +649,9 @@ public class RedirectIPTVParser {
             isValid = false;
         }
 
-        // Store in cache
+        // Store in cache with timestamp
         verifiedUrlCache.put(url, isValid);
+        cacheTimestamps.put(url, System.currentTimeMillis());
         return isValid;
     }
 
@@ -821,9 +812,6 @@ public class RedirectIPTVParser {
         return sb.toString();
     }
 
-    /**
-     * Cleanup method to release resources when done
-     */
     public void shutdown() {
         // Shutdown executor
         streamCheckExecutor.shutdown();
@@ -834,6 +822,413 @@ public class RedirectIPTVParser {
         } catch (InterruptedException e) {
             streamCheckExecutor.shutdownNow();
             Thread.currentThread().interrupt();
+        }
+    }
+
+    public List<String> searchChannels(String query, String category) {
+        if (primaryChannelUrlMap.isEmpty()) {
+            LOGGER.warning("Channel map is empty. Parse a playlist first.");
+            return Collections.emptyList();
+        }
+
+        // Create a cache key based on query and category
+        String cacheKey = (query + "_" + (category != null ? category : "")).toLowerCase();
+
+        // Check if we have a cached result that's still valid
+        if (searchResultsCache.containsKey(cacheKey)) {
+            long cacheTime = searchCacheTimestamps.getOrDefault(cacheKey, 0L);
+            if (System.currentTimeMillis() - cacheTime < SEARCH_CACHE_TTL) {
+                LOGGER.fine("Using cached search results for: " + cacheKey);
+                return new ArrayList<>(searchResultsCache.get(cacheKey)); // Return a copy to prevent modification
+            }
+        }
+
+        // Proceed with search as before
+        String normalizedQuery = query.toLowerCase().trim();
+        List<String> results = new ArrayList<>();
+        boolean categoryOnlySearch = normalizedQuery.isEmpty() && category != null && !category.isEmpty();
+
+        // Optimize search for performance when dealing with large playlists
+        if (primaryChannelUrlMap.size() > 500) {
+            // For large playlists, use parallel processing
+            results = primaryChannelUrlMap.keySet().parallelStream()
+                    .filter(channelName -> {
+                        if (category != null && !category.isEmpty()) {
+                            String channelGroup = channelGroupMap.get(channelName.toLowerCase());
+                            if (channelGroup == null || !channelGroup.toLowerCase().contains(category.toLowerCase())) {
+                                return false;
+                            }
+                        }
+
+                        if (categoryOnlySearch) {
+                            return true;
+                        }
+
+                        return channelName.toLowerCase().contains(normalizedQuery);
+                    })
+                    .collect(Collectors.toList());
+        } else {
+            // For smaller playlists, use the original approach
+            for (String channelName : primaryChannelUrlMap.keySet()) {
+                String channelGroup = channelGroupMap.get(channelName.toLowerCase());
+
+                if (category != null && !category.isEmpty()) {
+                    if (channelGroup == null || !channelGroup.toLowerCase().contains(category.toLowerCase())) {
+                        continue;
+                    }
+                }
+
+                if (categoryOnlySearch) {
+                    results.add(channelName);
+                    continue;
+                }
+
+                if (channelName.toLowerCase().contains(normalizedQuery)) {
+                    results.add(channelName);
+                }
+            }
+        }
+
+        // Sort results (only if necessary - skip for category-only searches as they could be large)
+        if (!categoryOnlySearch || results.size() < 1000) {
+            results.sort(String.CASE_INSENSITIVE_ORDER);
+        }
+
+        // Cache the results
+        searchResultsCache.put(cacheKey, new ArrayList<>(results));
+        searchCacheTimestamps.put(cacheKey, System.currentTimeMillis());
+
+        LOGGER.info("Search for \"" + query + "\" returned " + results.size() + " results");
+        return results;
+    }
+
+    public Map<String, Integer> getChannelCategories() {
+        if (channelGroupMap.isEmpty()) {
+            LOGGER.warning("Channel group map is empty. Parse a playlist first.");
+            return Collections.emptyMap();
+        }
+
+        // Create a map to count channels per category
+        Map<String, Integer> categories = new HashMap<>();
+
+        // Count channels in each category
+        for (String group : channelGroupMap.values()) {
+            if (group != null && !group.isEmpty()) {
+                categories.put(group, categories.getOrDefault(group, 0) + 1);
+            }
+        }
+
+        LOGGER.info("Found " + categories.size() + " distinct categories");
+        return categories;
+    }
+
+    private void clearSearchCache() {
+        searchResultsCache.clear();
+        searchCacheTimestamps.clear();
+        LOGGER.fine("Search cache cleared");
+    }
+
+    private int levenshteinDistance(String s1, String s2) {
+        int[] costs = new int[s2.length() + 1];
+        for (int i = 0; i <= s1.length(); i++) {
+            int lastValue = i;
+            for (int j = 0; j <= s2.length(); j++) {
+                if (i == 0) {
+                    costs[j] = j;
+                } else if (j > 0) {
+                    int newValue = costs[j - 1];
+                    if (s1.charAt(i - 1) != s2.charAt(j - 1)) {
+                        newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+                    }
+                    costs[j - 1] = lastValue;
+                    lastValue = newValue;
+                }
+            }
+            if (i > 0) {
+                costs[s2.length()] = lastValue;
+            }
+        }
+        return costs[s2.length()];
+    }
+
+    private boolean fuzzyMatch(String text, String query, double threshold) {
+        if (text.toLowerCase().contains(query.toLowerCase())) {
+            return true; // Exact substring match
+        }
+
+        // For very short queries (1-2 chars), only use exact matching
+        if (query.length() <= 2) {
+            return false;
+        }
+
+        int distance = levenshteinDistance(text.toLowerCase(), query.toLowerCase());
+        int maxLength = Math.max(text.length(), query.length());
+        double similarity = 1.0 - ((double) distance / maxLength);
+
+        return similarity >= threshold;
+    }
+
+    public List<String> fuzzySearchChannels(String query, String category, double threshold) {
+        if (primaryChannelUrlMap.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        String normalizedQuery = query.toLowerCase().trim();
+        List<String> results = new ArrayList<>();
+
+        // Use different thresholds based on query length
+        // Shorter queries need higher similarity to avoid too many false positives
+        double adjustedThreshold = threshold;
+        if (normalizedQuery.length() <= 3) {
+            adjustedThreshold = Math.max(0.8, threshold); // Higher threshold for short queries
+        } else if (normalizedQuery.length() >= 6) {
+            adjustedThreshold = Math.min(0.6, threshold); // Lower threshold for longer queries
+        }
+
+        for (String channelName : primaryChannelUrlMap.keySet()) {
+            // Check category filter first
+            if (category != null && !category.isEmpty()) {
+                String channelGroup = channelGroupMap.get(channelName.toLowerCase());
+                if (channelGroup == null || !channelGroup.toLowerCase().contains(category.toLowerCase())) {
+                    continue;
+                }
+            }
+
+            // Skip fuzzy matching if query is empty
+            if (normalizedQuery.isEmpty()) {
+                results.add(channelName);
+                continue;
+            }
+
+            // Apply fuzzy matching
+            if (fuzzyMatch(channelName, normalizedQuery, adjustedThreshold)) {
+                results.add(channelName);
+            }
+        }
+
+        // Sort results by relevance (exact matches first, then by similarity)
+        results.sort((a, b) -> {
+            boolean aContains = a.toLowerCase().contains(normalizedQuery);
+            boolean bContains = b.toLowerCase().contains(normalizedQuery);
+
+            if (aContains && !bContains) return -1;
+            if (!aContains && bContains) return 1;
+
+            int aDistance = levenshteinDistance(a.toLowerCase(), normalizedQuery);
+            int bDistance = levenshteinDistance(b.toLowerCase(), normalizedQuery);
+
+            return Integer.compare(aDistance, bDistance);
+        });
+
+        return results;
+    }
+
+    private void performSelfHealing() {
+        try {
+            LOGGER.info("Running self-healing routine");
+
+            // Check if maps are inconsistent
+            if (primaryChannelUrlMap.size() != channelUrlsMap.size()) {
+                LOGGER.warning("Detected inconsistency in channel maps, attempting repair");
+
+                // Rebuild primary map from the backup map
+                for (Map.Entry<String, List<String>> entry : channelUrlsMap.entrySet()) {
+                    if (!entry.getValue().isEmpty() && !primaryChannelUrlMap.containsKey(entry.getKey())) {
+                        primaryChannelUrlMap.put(entry.getKey(), entry.getValue().get(0));
+                    }
+                }
+            }
+
+            // Check for broken references
+            int cleanedUp = 0;
+            for (Iterator<Map.Entry<String, String>> it = primaryChannelUrlMap.entrySet().iterator(); it.hasNext();) {
+                Map.Entry<String, String> entry = it.next();
+                if (entry.getValue() == null || entry.getValue().isEmpty()) {
+                    it.remove();
+                    cleanedUp++;
+                }
+            }
+
+            if (cleanedUp > 0) {
+                LOGGER.info("Cleaned up " + cleanedUp + " invalid channel entries");
+            }
+
+            // Check verification cache health
+            long staleEntries = verifiedUrlCache.entrySet().stream()
+                    .filter(e -> cacheTimestamps.getOrDefault(e.getKey(), 0L) <
+                            System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24))
+                    .count();
+
+            if (staleEntries > 100) {
+                LOGGER.info("Cleaning up " + staleEntries + " stale verification cache entries");
+                clearVerificationCache();
+            }
+
+            LOGGER.info("Self-healing completed successfully");
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error during self-healing", e);
+        }
+    }
+
+    private void clearVerificationCache() {
+        LOGGER.info("Clearing URL verification cache with " + verifiedUrlCache.size() + " entries");
+        verifiedUrlCache.clear();
+        cacheTimestamps.clear();
+    }
+
+    private void checkMemoryUsage() {
+        Runtime runtime = Runtime.getRuntime();
+        long usedMemory = runtime.totalMemory() - runtime.freeMemory();
+        long maxMemory = runtime.maxMemory();
+        double memoryUsagePercent = (double) usedMemory / maxMemory * 100;
+
+        if (memoryUsagePercent > 75) {
+            LOGGER.warning("High memory usage detected: " + String.format("%.2f%%", memoryUsagePercent));
+            LOGGER.info("Suggesting garbage collection...");
+            System.gc();
+        }
+    }
+
+    private void optimizeMemoryAfterParsing() {
+        // Check if the playlist is large (over certain size threshold)
+        if (playlistContent != null && playlistContent.length() > 10_000_000) { // 10MB
+            // Clear the original content to free memory
+            LOGGER.info("Clearing original playlist content to free memory");
+            playlistContent = null;
+
+            // Suggest garbage collection
+            checkMemoryUsage();
+        }
+    }
+
+    private void asyncPreVerifyPopularChannels() {
+        if (primaryChannelUrlMap.isEmpty()) return;
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                List<String> channelNames = new ArrayList<>(primaryChannelUrlMap.keySet());
+                // Sort by potential popularity - prefer shorter names which are often major channels
+                channelNames.sort(Comparator.comparingInt(String::length));
+
+                // Only take up to 20 channels to avoid long verification times
+                int channelsToVerify = Math.min(20, channelNames.size());
+
+                LOGGER.info("Pre-verifying " + channelsToVerify + " popular channels asynchronously");
+
+                for (int i = 0; i < channelsToVerify; i++) {
+                    String channelName = channelNames.get(i);
+                    String url = primaryChannelUrlMap.get(channelName);
+
+                    try {
+                        verifyStreamUrl(url);
+                        // Brief pause between verifications
+                        Thread.sleep(100);
+                    } catch (Exception e) {
+                        // Just log, don't fail the whole process
+                        LOGGER.fine("Pre-verification failed for " + channelName + ": " + e.getMessage());
+                    }
+                }
+
+                LOGGER.info("Pre-verification complete");
+            } catch (Exception e) {
+                LOGGER.warning("Error in async pre-verification: " + e.getMessage());
+            }
+        }, streamCheckExecutor);
+    }
+
+    private List<String> emergencyFallbackSearch(String query, String category) {
+        List<String> results = new ArrayList<>();
+        String normalizedQuery = query.toLowerCase();
+
+        for (String channelName : primaryChannelUrlMap.keySet()) {
+            if ((normalizedQuery.isEmpty() || channelName.toLowerCase().contains(normalizedQuery)) &&
+                    (category == null || category.isEmpty() ||
+                            (channelGroupMap.containsKey(channelName.toLowerCase()) &&
+                                    channelGroupMap.get(channelName.toLowerCase()).toLowerCase().contains(category.toLowerCase())))) {
+                results.add(channelName);
+            }
+        }
+
+        return results;
+    }
+
+    public List<String> searchChannelsWithRecovery(String query, String category) {
+        try {
+            // Try regular search first
+            return searchChannels(query, category);
+        } catch (Exception e) {
+            LOGGER.warning("Error in primary search method: " + e.getMessage());
+
+            // Fallback to a simpler, more robust search algorithm
+            try {
+                LOGGER.info("Trying fallback search method");
+                return emergencyFallbackSearch(query, category);
+            } catch (Exception e2) {
+                LOGGER.severe("Even fallback search failed: " + e2.getMessage());
+                return Collections.emptyList();
+            }
+        }
+    }
+
+    public List<String> getPopularChannels(int limit) {
+        if (primaryChannelUrlMap.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // Create a list with all channel names
+        List<String> allChannels = new ArrayList<>(primaryChannelUrlMap.keySet());
+
+        // Apply heuristics to find potentially popular channels
+        // 1. Shorter names are often major networks (CNN, BBC, etc.)
+        // 2. Channels with verified URLs are more likely to be popular
+
+        // Sort by verified status and name length
+        allChannels.sort((a, b) -> {
+            String urlA = primaryChannelUrlMap.get(a);
+            String urlB = primaryChannelUrlMap.get(b);
+
+            // First sort by verified status
+            boolean aVerified = verifiedUrlCache.getOrDefault(urlA, false);
+            boolean bVerified = verifiedUrlCache.getOrDefault(urlB, false);
+
+            if (aVerified && !bVerified) return -1;
+            if (!aVerified && bVerified) return 1;
+
+            // Then by name length (shorter names first)
+            return Integer.compare(a.length(), b.length());
+        });
+
+        // Return the top channels up to the limit
+        return allChannels.subList(0, Math.min(limit, allChannels.size()));
+    }
+
+    public boolean validateStream(String streamUrl) {
+        // Skip validation for non-HTTP URLs
+        if (!streamUrl.startsWith("http")) {
+            return true;
+        }
+
+        try {
+            URL url = new URL(streamUrl);
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("HEAD");
+            connection.setConnectTimeout(3000);
+            connection.setReadTimeout(3000);
+
+            int responseCode = connection.getResponseCode();
+            return responseCode >= 200 && responseCode < 400;
+        } catch (Exception e) {
+            LOGGER.fine("Stream validation failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private void cleanupAfterParsing() {
+        // Free memory by clearing the raw playlist content after parsing
+        if (playlistContent != null && playlistContent.length() > 5_000_000) { // 5MB
+            LOGGER.info("Clearing original playlist content to free memory");
+            playlistContent = null;
+            System.gc(); // Suggest garbage collection
         }
     }
 }

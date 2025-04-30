@@ -41,6 +41,8 @@ public class OBSController implements WebSocket.Listener {
     private final String sourceNamePrefix = "IPTV-Source-";
     private String currentSourceName;
 
+    private final SimpleRateLimiter obsRequestLimiter = new SimpleRateLimiter(10.0);
+
     public OBSController() {
         this("localhost", "");
     }
@@ -48,6 +50,18 @@ public class OBSController implements WebSocket.Listener {
     public OBSController(String serverAddress, String password) {
         this.serverAddress = serverAddress;
         this.password = password;
+    }
+
+    public boolean isConnected() {
+        return isConnected;
+    }
+
+    private CompletableFuture<JSONObject> sendRateLimitedRequest(String requestType, JSONObject data) {
+        // Wait for rate limiter permission
+        obsRequestLimiter.acquire();
+
+        // Then send the actual request
+        return sendRequest(requestType, data);
     }
 
     public boolean connect() {

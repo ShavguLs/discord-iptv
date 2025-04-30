@@ -5,13 +5,17 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 import java.util.Scanner;
-import java.util.logging.Level;
-import java.util.logging.LogManager;
-import java.util.logging.Logger;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.*;
 
 public class Main {
     private static final Logger LOGGER = Logger.getLogger(Main.class.getName());
@@ -157,5 +161,121 @@ public class Main {
         }
 
         return obsPath != null && Files.exists(obsPath);
+    }
+
+    // Add to Main class
+    /**
+     * Set up enhanced logging with rotation and filtering
+     */
+    private static void setupEnhancedLogging() {
+        try {
+            // Create log directory if it doesn't exist
+            Path logDir = Paths.get("logs");
+            if (!Files.exists(logDir)) {
+                Files.createDirectory(logDir);
+            }
+
+            // Set up log rotation
+            FileHandler fileHandler = new FileHandler("logs/iptv_%g.log", 5 * 1024 * 1024, 5, true);
+            fileHandler.setFormatter(new SimpleFormatter() {
+                @Override
+                public String format(LogRecord record) {
+                    ZonedDateTime zdt = ZonedDateTime.ofInstant(
+                            Instant.ofEpochMilli(record.getMillis()),
+                            ZoneId.systemDefault());
+
+                    return String.format("[%s] [%s] [%s] %s%n",
+                            zdt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")),
+                            record.getLevel(),
+                            record.getLoggerName(),
+                            record.getMessage());
+                }
+            });
+
+            // Set up console handler with filtering to reduce noise
+            ConsoleHandler consoleHandler = new ConsoleHandler();
+            consoleHandler.setFilter(record -> {
+                // Filter out excessive FFmpeg output in console
+                if (record.getMessage().contains("frame=") ||
+                        record.getMessage().contains("speed=")) {
+                    return false;
+                }
+                return true;
+            });
+
+            // Get root logger and clean existing handlers
+            Logger rootLogger = Logger.getLogger("");
+            Handler[] handlers = rootLogger.getHandlers();
+            for (Handler handler : handlers) {
+                rootLogger.removeHandler(handler);
+            }
+
+            // Add our custom handlers
+            rootLogger.addHandler(fileHandler);
+            rootLogger.addHandler(consoleHandler);
+
+            LOGGER.info("Enhanced logging setup complete");
+        } catch (Exception e) {
+            System.err.println("Error setting up enhanced logging: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static final ExecutorService GENERAL_POOL = Executors.newFixedThreadPool(
+            Math.max(2, Runtime.getRuntime().availableProcessors() - 1),
+            new ThreadFactory() {
+                private final AtomicInteger threadNumber = new AtomicInteger(1);
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "iptv-worker-" + threadNumber.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                }
+            }
+    );
+
+    // Dedicated pools for specific tasks
+    private static final ScheduledExecutorService MONITORING_POOL = Executors.newScheduledThreadPool(2);
+    private static final ExecutorService STREAM_VERIFICATION_POOL = Executors.newFixedThreadPool(3);
+
+    // Shutdown hook to clean up threads
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            shutdownPool(GENERAL_POOL, "General Pool");
+            shutdownPool(MONITORING_POOL, "Monitoring Pool");
+            shutdownPool(STREAM_VERIFICATION_POOL, "Stream Verification Pool");
+        }));
+    }
+
+    private static void shutdownPool(ExecutorService pool, String poolName) {
+        try {
+            LOGGER.info("Shutting down " + poolName);
+            pool.shutdown();
+            if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOGGER.warning(poolName + " did not terminate in time, forcing shutdown");
+                pool.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            LOGGER.warning("Interrupted while shutting down " + poolName);
+            pool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // Methods to submit tasks to appropriate pools
+    public static Future<?> submitTask(Runnable task) {
+        return GENERAL_POOL.submit(task);
+    }
+
+    public static ScheduledFuture<?> scheduleTask(Runnable task, long delay, TimeUnit unit) {
+        return MONITORING_POOL.schedule(task, delay, unit);
+    }
+
+    public static ScheduledFuture<?> scheduleRepeatingTask(Runnable task, long initialDelay, long period, TimeUnit unit) {
+        return MONITORING_POOL.scheduleAtFixedRate(task, initialDelay, period, unit);
+    }
+
+    public static Future<?> submitStreamVerification(Runnable task) {
+        return STREAM_VERIFICATION_POOL.submit(task);
     }
 }
