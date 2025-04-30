@@ -169,61 +169,60 @@ public class OBSController implements WebSocket.Listener {
         }
 
         try {
-            LOGGER.info("Hello message structure: " + hello.toString());
+            LOGGER.info("Processing authentication for OBS WebSocket v5");
+
+            // Extract authentication details from hello message
             JSONObject d = hello.getJSONObject("d");
             boolean authRequired = false;
             String challenge = null;
             String salt = null;
 
             // Check if authentication is required
-            if (d.has("authentication")) {
-                if (!d.isNull("authentication")) {
-                    authRequired = true;
-                    JSONObject auth = d.getJSONObject("authentication");
-                    LOGGER.info("Authentication required. Processing...");
-                    challenge = auth.getString("challenge");
-                    salt = auth.getString("salt");
-                }
+            if (d.has("authentication") && !d.isNull("authentication")) {
+                authRequired = true;
+                JSONObject auth = d.getJSONObject("authentication");
+                LOGGER.info("Authentication required by OBS WebSocket");
+                challenge = auth.getString("challenge");
+                salt = auth.getString("salt");
             }
 
             // Create identity message
             JSONObject identify = new JSONObject();
-            identify.put("op", 1); // Identify op code
+            identify.put("op", 1); // Identify op code for OBS WebSocket v5
 
             JSONObject identifyData = new JSONObject();
             identifyData.put("rpcVersion", 1);
 
             // Add authentication if required
             if (authRequired && challenge != null && salt != null) {
+                if (password == null || password.isEmpty()) {
+                    LOGGER.warning("OBS requires authentication but no password was provided");
+                    // Continue anyway, using empty password
+                }
+
                 String authResponse = calculateAuthResponse(salt, challenge, password);
                 identifyData.put("authentication", authResponse);
+                LOGGER.info("Added authentication token to identify message");
+            } else {
+                LOGGER.info("No authentication required by OBS WebSocket");
             }
 
-            // Subscribe to events (bitwise flags: InputCreated, InputRemoved, SceneItemCreated, SceneItemRemoved, VirtualcamStateChanged)
+            // Always subscribe to essential events (bitwise flags)
             identifyData.put("eventSubscriptions", 33);
-
             identify.put("d", identifyData);
 
             // Send identify request
-            LOGGER.info("Sending identify request: " + identify.toString());
-            try {
-                webSocket.sendText(identify.toString(), true);
+            LOGGER.info("Sending identify request to OBS WebSocket");
+            webSocket.sendText(identify.toString(), true);
 
-                // For authentication without requiring a reply, mark as authenticated immediately when no auth is required
-                if (!authRequired) {
-                    LOGGER.info("No authentication required, marking as authenticated");
-                    isAuthenticated = true;
-                }
-
-                return true;
-            } catch (Exception e) {
-                LOGGER.severe("Failed to send identify request: " + e.getMessage());
-                e.printStackTrace();
-                return false;
+            // For non-authenticated connections, set authenticated immediately
+            if (!authRequired) {
+                isAuthenticated = true;
             }
+
+            return true;
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Authentication error: " + e.getMessage(), e);
-            e.printStackTrace();
             return false;
         }
     }
@@ -1090,58 +1089,57 @@ public class OBSController implements WebSocket.Listener {
         }
 
         String message = data.toString();
-        LOGGER.info("Received message: " + message);  // Changed to INFO level to see all messages
 
         try {
             JSONObject response = new JSONObject(message);
-            int opCode = response.getInt("op");
+            int opCode = response.optInt("op", -1);
 
-            LOGGER.info("Processing message with op code: " + opCode);
+            if (opCode == -1) {
+                LOGGER.warning("Received message with no op code: " + message);
+                return WebSocket.Listener.super.onText(webSocket, data, last);
+            }
+
+            LOGGER.fine("Received OBS WebSocket message with op code: " + opCode);
 
             switch (opCode) {
                 case 0: // Hello message
-                    LOGGER.info("Received Hello message");
-                    // Use the webSocket parameter directly from this method
-                    this.webSocket = webSocket; // Ensure the webSocket field is correctly set
+                    LOGGER.info("Received Hello message from OBS WebSocket");
+                    // Store the webSocket reference and authenticate
+                    this.webSocket = webSocket;
                     boolean authSuccess = authenticate(response);
-                    LOGGER.info("Authentication process result: " + (authSuccess ? "Success" : "Failed"));
+                    LOGGER.info("Authentication process initiated: " + (authSuccess ? "Success" : "Failed"));
                     break;
 
                 case 2: // Identified message
                     LOGGER.info("Successfully identified with OBS WebSocket");
                     isAuthenticated = true;
+                    connectionInProgress = false;
                     break;
 
                 case 3: // Authentication failure
-                    String error = "Unknown error";
-                    try {
-                        if (response.has("d") && response.getJSONObject("d").has("error")) {
-                            error = response.getJSONObject("d").getString("error");
-                        }
-                    } catch (Exception e) {
-                        // Ignore and use default error message
-                    }
-                    LOGGER.severe("Authentication/Identification failed: " + error);
+                    String error = response.has("d") && response.getJSONObject("d").has("error")
+                            ? response.getJSONObject("d").getString("error")
+                            : "Unknown error";
+
+                    LOGGER.severe("OBS WebSocket authentication failed: " + error);
+                    isAuthenticated = false;
                     connectionInProgress = false;
                     break;
 
                 case 7: // RequestResponse message
-                    LOGGER.info("Received RequestResponse message");
                     handleRequestResponse(response);
                     break;
 
                 case 5: // Event message
-                    LOGGER.info("Received Event message");
                     handleEvent(response);
                     break;
 
                 default:
-                    LOGGER.info("Received op code: " + opCode + " - Data: " + response.toString());
+                    LOGGER.fine("Received unhandled op code: " + opCode);
                     break;
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error processing WebSocket message: " + message, e);
-            e.printStackTrace();
         }
 
         return WebSocket.Listener.super.onText(webSocket, data, last);

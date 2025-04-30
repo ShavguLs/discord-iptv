@@ -342,6 +342,7 @@ public class RedirectIPTVParser {
 
         // Measure parsing performance
         long startTime = System.currentTimeMillis();
+        long memoryBefore = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
 
         // Clear previous data
         channelUrlsMap.clear();
@@ -350,6 +351,7 @@ public class RedirectIPTVParser {
         verifiedUrlCache.clear();
 
         // Use BufferedReader for more efficient line-by-line processing
+        // This avoids keeping the entire file in memory during parsing
         try (BufferedReader reader = new BufferedReader(new StringReader(playlistContent))) {
             String line;
             String currentChannelName = null;
@@ -358,11 +360,16 @@ public class RedirectIPTVParser {
             boolean processingExtinf = false;
             int lineCount = 0;
             int channelCount = 0;
+            int duplicateCount = 0;
+
+            final int PROGRESS_REPORTING_LINES = 10000;
+            final int MEMORY_CHECK_INTERVAL = 50000;
 
             while ((line = reader.readLine()) != null) {
                 lineCount++;
-                line = line.trim();
-                if (line.isEmpty()) continue;
+
+                // Skip empty lines
+                if (line.trim().isEmpty()) continue;
 
                 // Process EXTINF lines
                 if (line.startsWith(EXTINF_PREFIX)) {
@@ -373,8 +380,15 @@ public class RedirectIPTVParser {
                     currentChannelName = extractChannelName(line);
                     currentGroupTitle = extractGroupTitle(line);
 
-                    if (lineCount % 5000 == 0) {
-                        LOGGER.info("Parsing progress: " + lineCount + " lines...");
+                    // Progress reporting for large playlists
+                    if (lineCount % PROGRESS_REPORTING_LINES == 0) {
+                        LOGGER.info("Parsing progress: " + lineCount + " lines, " +
+                                channelCount + " channels found...");
+                    }
+
+                    // Periodic memory usage check
+                    if (lineCount % MEMORY_CHECK_INTERVAL == 0) {
+                        checkMemoryUsage();
                     }
                 }
                 // Handle multi-line EXTINF (some playlists format this way)
@@ -395,26 +409,28 @@ public class RedirectIPTVParser {
                         currentChannelName = "Channel-" + (channelUrlsMap.size() + 1);
                     }
 
-                    // Add to channel maps
-                    String normalizedName = currentChannelName.toLowerCase();
+                    // Normalize the channel name - improved to handle special characters better
+                    String normalizedName = normalizeChannelName(currentChannelName);
 
                     // Store the group if available
                     if (currentGroupTitle != null && !currentGroupTitle.isEmpty()) {
                         channelGroupMap.put(normalizedName, currentGroupTitle);
                     }
 
-                    // Store the URL with fallback support
-                    List<String> urls = channelUrlsMap.computeIfAbsent(normalizedName, k -> new ArrayList<>(2)); // Most channels only have 1-2 URLs
-                    urls.add(line);
+                    // Store the URL with fallback support - avoid duplicate entries
+                    List<String> urls = channelUrlsMap.computeIfAbsent(normalizedName, k -> new ArrayList<>(2));
+
+                    // Only add the URL if it's not already in the list for this channel
+                    if (!urls.contains(line)) {
+                        urls.add(line);
+                    } else {
+                        duplicateCount++;
+                    }
 
                     // Also store as primary URL if it's the first one
                     if (!primaryChannelUrlMap.containsKey(normalizedName)) {
                         primaryChannelUrlMap.put(normalizedName, line);
                         channelCount++;
-
-                        if (channelCount % 1000 == 0) {
-                            LOGGER.info("Found " + channelCount + " channels so far...");
-                        }
                     }
 
                     // Reset for next channel
@@ -424,19 +440,51 @@ public class RedirectIPTVParser {
             }
 
             long endTime = System.currentTimeMillis();
+            long memoryAfter = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+            long memoryUsed = memoryAfter - memoryBefore;
 
-            LOGGER.info("Parsing complete. Found " + primaryChannelUrlMap.size() +
-                    " channels in " + (endTime - startTime) + "ms");
+            LOGGER.info(String.format("Parsing complete. Found %d channels (skipped %d duplicates) in %d ms. Memory used: %.2f MB",
+                    primaryChannelUrlMap.size(), duplicateCount, (endTime - startTime), memoryUsed / (1024.0 * 1024.0)));
+
+            // Clear search cache after parsing new content
             clearSearchCache();
+
+            // Explicitly clear the original content to free memory if it's large
+            if (playlistContent.length() > 5_000_000) { // 5MB
+                LOGGER.info("Clearing original playlist content to free memory");
+                playlistContent = null;
+                System.gc(); // Suggest garbage collection
+            }
+
+            // Pre-verify popular channels asynchronously
             asyncPreVerifyPopularChannels();
+        } catch (OutOfMemoryError oom) {
+            LOGGER.severe("Out of memory error while parsing playlist: " + oom.getMessage());
+            // Emergency cleanup
+            playlistContent = null;
+            System.gc();
+            throw oom; // Re-throw to inform caller
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error parsing playlist content", e);
         }
     }
 
-    /**
-     * Pre-verify the most commonly used channels to speed up initial selection
-     */
+    private String normalizeChannelName(String channelName) {
+        if (channelName == null) return "";
+
+        // Convert to lowercase for case-insensitive comparison
+        String normalized = channelName.toLowerCase();
+
+        // Remove common problematic characters that could cause parsing issues
+        normalized = normalized.trim()
+                .replace('|', ' ')
+                .replace('/', ' ')
+                .replace('\\', ' ')
+                .replaceAll("\\s+", " "); // Replace multiple spaces with a single space
+
+        return normalized;
+    }
+
     private void preVerifyPopularChannels() {
         if (primaryChannelUrlMap.isEmpty()) return;
 
@@ -472,9 +520,103 @@ public class RedirectIPTVParser {
         }
     }
 
-    /**
-     * Gets a stream URL with fallback support - will try alternative streams if available
-     */
+    private void checkMemoryUsage() {
+        Runtime runtime = Runtime.getRuntime();
+        long maxMemory = runtime.maxMemory();
+        long allocatedMemory = runtime.totalMemory();
+        long freeMemory = runtime.freeMemory();
+        long usedMemory = allocatedMemory - freeMemory;
+        double percentUsed = (double) usedMemory / maxMemory * 100;
+
+        LOGGER.fine(String.format("Memory usage: %.2f%% (used: %.2f MB, max: %.2f MB)",
+                percentUsed, usedMemory / (1024.0 * 1024.0), maxMemory / (1024.0 * 1024.0)));
+
+        // Log warning if memory usage is high
+        if (percentUsed > 80) {
+            LOGGER.warning(String.format("High memory usage detected: %.2f%%", percentUsed));
+            // Try to free memory
+            clearCaches();
+        }
+    }
+
+    private void clearCaches() {
+        LOGGER.info("Clearing caches to free memory");
+
+        // Keep only recent verified URLs
+        if (verifiedUrlCache.size() > 100) {
+            LOGGER.info("Trimming URL verification cache from " + verifiedUrlCache.size() + " entries");
+
+            // Keep only entries verified in the last hour
+            long cutoffTime = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1);
+
+            verifiedUrlCache.entrySet().removeIf(entry ->
+                    cacheTimestamps.getOrDefault(entry.getKey(), 0L) < cutoffTime);
+
+            // Also clean up the timestamps map
+            cacheTimestamps.entrySet().removeIf(entry ->
+                    entry.getValue() < cutoffTime);
+
+            LOGGER.info("Verification cache reduced to " + verifiedUrlCache.size() + " entries");
+        }
+
+        // Clear search cache entirely
+        clearSearchCache();
+    }
+
+    private String downloadWithChunking(String urlString) throws IOException {
+        URL url = new URL(urlString);
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+
+        // Set proper headers
+        connection.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+        connection.setConnectTimeout(CONNECTION_TIMEOUT);
+        connection.setReadTimeout(READ_TIMEOUT);
+
+        // Check response code
+        int responseCode = connection.getResponseCode();
+        if (responseCode != HttpURLConnection.HTTP_OK) {
+            connection.disconnect();
+            throw new IOException("HTTP error: " + responseCode);
+        }
+
+        // Create a memory-efficient string builder
+        StringBuilder content = new StringBuilder();
+
+        // Get content length if available
+        int contentLength = connection.getContentLength();
+        if (contentLength > 0) {
+            LOGGER.info("Downloading playlist: " + (contentLength / 1024) + " KB");
+        }
+
+        // Read in chunks to avoid memory issues
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8), 8192)) {
+
+            char[] buffer = new char[8192];
+            int bytesRead;
+            long totalRead = 0;
+            long lastLogTime = System.currentTimeMillis();
+
+            while ((bytesRead = reader.read(buffer)) != -1) {
+                content.append(buffer, 0, bytesRead);
+                totalRead += bytesRead;
+
+                // Log progress periodically for large files
+                long now = System.currentTimeMillis();
+                if (contentLength > 1_000_000 && now - lastLogTime > 2000) {
+                    LOGGER.info(String.format("Download progress: %.1f%% (%d KB of %d KB)",
+                            (totalRead * 100.0 / contentLength), totalRead / 1024, contentLength / 1024));
+                    lastLogTime = now;
+                }
+            }
+
+            return content.toString();
+        } finally {
+            connection.disconnect();
+        }
+    }
+
     public String getStreamUrl(String channelName) {
         if (primaryChannelUrlMap.isEmpty()) {
             LOGGER.warning("Channel map is empty. Parse a playlist first.");
@@ -1074,19 +1216,6 @@ public class RedirectIPTVParser {
         LOGGER.info("Clearing URL verification cache with " + verifiedUrlCache.size() + " entries");
         verifiedUrlCache.clear();
         cacheTimestamps.clear();
-    }
-
-    private void checkMemoryUsage() {
-        Runtime runtime = Runtime.getRuntime();
-        long usedMemory = runtime.totalMemory() - runtime.freeMemory();
-        long maxMemory = runtime.maxMemory();
-        double memoryUsagePercent = (double) usedMemory / maxMemory * 100;
-
-        if (memoryUsagePercent > 75) {
-            LOGGER.warning("High memory usage detected: " + String.format("%.2f%%", memoryUsagePercent));
-            LOGGER.info("Suggesting garbage collection...");
-            System.gc();
-        }
     }
 
     private void optimizeMemoryAfterParsing() {

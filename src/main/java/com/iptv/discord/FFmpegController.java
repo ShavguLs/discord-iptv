@@ -50,6 +50,8 @@ public class FFmpegController {
         INVALID_DATA,
         STREAM_STALLED,
         UNEXPECTED_EXIT,
+        INPUT_ERROR,   // New: File not found, permission issues, etc.
+        PROTOCOL_ERROR, // New: Protocol-related errors
         UNKNOWN
     }
 
@@ -123,36 +125,107 @@ public class FFmpegController {
     }
 
     private void processFFmpegOutput(String line) {
-        // Process FFmpeg output line for better error detection
+        // Enhanced pattern matching for FFmpeg errors
+        if (line == null || line.isEmpty()) {
+            return;
+        }
 
-        // Check for error messages
-        Matcher errorMatcher = ERROR_PATTERN.matcher(line);
+        // Check for common error patterns with improved regex
+        Pattern enhancedErrorPattern = Pattern.compile(
+                "(Connection refused|Connection timed out|Server returned|Invalid data|Failed to|" +
+                        "Error|No such file|Cannot|Could not|Unable to|Permission denied|Protocol not found|" +
+                        "HTTP error|Server error|unexpected|Input/output error|access denied)",
+                Pattern.CASE_INSENSITIVE);
+
+        Matcher errorMatcher = enhancedErrorPattern.matcher(line);
+
         if (line.contains("Error") || line.contains("error") || errorMatcher.find()) {
             LOGGER.warning("FFmpeg error: " + line);
 
-            // Categorize the error
-            ErrorType detectedType = categorizeError(line);
+            // Better error categorization
+            ErrorType detectedType = categorizeErrorEnhanced(line);
             errorCounts.get(detectedType).incrementAndGet();
             lastErrorType = detectedType;
             lastErrorMessage = line;
 
-            // Check if this is a critical error that means we should give up
+            // Check for critical errors that require immediate action
             if (isCriticalError(line)) {
                 criticalErrorDetected.set(true);
                 LOGGER.severe("Critical stream error detected: " + line);
             }
         }
-        // Check for progress information
+        // Check for progress information to detect stalls
         else if (line.contains("speed=") || line.contains("frame=")) {
             lastProgressUpdate = System.currentTimeMillis();
-
-            // Extract more detailed progress information if needed
             extractProgressInfo(line);
-
-            // Regular FFmpeg progress output, log at finest level
             LOGGER.finest(line);
-        } else {
+        }
+        // Check for initialization success indicators
+        else if (line.contains("Output #0") || line.contains("Stream mapping")) {
+            LOGGER.info("FFmpeg initialization: " + line);
+        }
+        // General log messages at finer level
+        else {
             LOGGER.fine(line);
+        }
+    }
+
+    private ErrorType categorizeErrorEnhanced(String errorLine) {
+        errorLine = errorLine.toLowerCase();
+
+        // Network connectivity issues
+        if (errorLine.contains("connection refused") ||
+                errorLine.contains("failed to connect") ||
+                errorLine.contains("network is unreachable")) {
+            return ErrorType.CONNECTION_REFUSED;
+        }
+
+        // Timeout issues
+        else if (errorLine.contains("connection timed out") ||
+                errorLine.contains("timeout") ||
+                errorLine.contains("operation timed out")) {
+            return ErrorType.CONNECTION_TIMEOUT;
+        }
+
+        // Server-side errors
+        else if (errorLine.contains("server returned") ||
+                errorLine.contains("server error") ||
+                errorLine.contains("403") ||
+                errorLine.contains("404") ||
+                errorLine.contains("500") ||
+                errorLine.contains("503")) {
+            return ErrorType.SERVER_ERROR;
+        }
+
+        // Data corruption or format issues
+        else if (errorLine.contains("invalid data") ||
+                errorLine.contains("corrupt") ||
+                errorLine.contains("malformed") ||
+                errorLine.contains("error while decoding") ||
+                errorLine.contains("invalid packet") ||
+                errorLine.contains("buffer underflow") ||
+                errorLine.contains("error in the stream")) {
+            return ErrorType.INVALID_DATA;
+        }
+
+        // Input source issues
+        else if (errorLine.contains("no such file") ||
+                errorLine.contains("cannot open") ||
+                errorLine.contains("could not open") ||
+                errorLine.contains("input/output error")) {
+            return ErrorType.INPUT_ERROR;
+        }
+
+        // Protocol issues
+        else if (errorLine.contains("unknown protocol") ||
+                errorLine.contains("protocol not found") ||
+                errorLine.contains("protocol error")) {
+            return ErrorType.PROTOCOL_ERROR;
+        }
+
+        // Any other errors
+        else {
+            return ErrorType.UNKNOWN;
         }
     }
 
@@ -177,18 +250,48 @@ public class FFmpegController {
     private boolean isCriticalError(String errorLine) {
         errorLine = errorLine.toLowerCase();
 
-        // Errors that indicate the stream is permanently unavailable
+        // Expanded list of critical errors that indicate the stream is permanently unavailable
         return errorLine.contains("403 forbidden") ||
                 errorLine.contains("404 not found") ||
                 errorLine.contains("access denied") ||
                 errorLine.contains("authentication failed") ||
-                errorLine.contains("no such file or directory");
+                errorLine.contains("no such file or directory") ||
+                errorLine.contains("permission denied") ||
+                errorLine.contains("cannot allocate memory") ||
+                errorLine.contains("protocol not found") ||
+                errorLine.contains("invalid argument") ||
+                errorLine.contains("resource temporarily unavailable") ||
+                errorLine.contains("unknown encoder") ||
+                (errorLine.contains("server") && errorLine.contains("not found"));
     }
 
-    // Extract and potentially store progress information
     private void extractProgressInfo(String progressLine) {
-        // Could extract frame rate, speed, etc. if needed for more detailed monitoring
-        // For now we just update the timestamp
+        try {
+            // Extract frame rate information
+            Pattern fpsPattern = Pattern.compile("fps=\\s*(\\d+)");
+            Matcher fpsMatcher = fpsPattern.matcher(progressLine);
+            if (fpsMatcher.find()) {
+                int fps = Integer.parseInt(fpsMatcher.group(1));
+                // Log low FPS as warning
+                if (fps < 5) {
+                    LOGGER.warning("Low frame rate detected: " + fps + " fps");
+                }
+            }
+
+            // Extract speed information
+            Pattern speedPattern = Pattern.compile("speed=\\s*(\\d+\\.?\\d*)x");
+            Matcher speedMatcher = speedPattern.matcher(progressLine);
+            if (speedMatcher.find()) {
+                double speed = Double.parseDouble(speedMatcher.group(1));
+                // Log very slow processing as warning
+                if (speed < 0.5) {
+                    LOGGER.warning("Slow processing speed: " + speed + "x");
+                }
+            }
+        } catch (Exception e) {
+            // Don't let parsing errors affect main processing
+            LOGGER.fine("Error parsing progress info: " + e.getMessage());
+        }
     }
 
     private List<String> buildFFmpegCommand() {
@@ -279,7 +382,7 @@ public class FFmpegController {
             return;
         }
 
-        // Check if we've exceeded the maximum number of attempts for this specific error type
+        // Check restart attempts against limits
         int maxAttemptsForErrorType = getMaxAttemptsForErrorType(lastErrorType);
         int currentErrorTypeCount = errorCounts.get(lastErrorType).get();
 
@@ -288,7 +391,18 @@ public class FFmpegController {
             LOGGER.info("Attempting to restart FFmpeg (Attempt " +
                     restartAttempts + "/" + MAX_RESTART_ATTEMPTS + ", Error type: " + lastErrorType + ")");
 
-            // Wait with dynamic backoff based on error type
+            // Always ensure old process is completely terminated
+            if (ffmpegProcess != null) {
+                try {
+                    ffmpegProcess.destroyForcibly();
+                    ffmpegProcess.waitFor(2, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    LOGGER.warning("Error terminating previous FFmpeg process: " + e.getMessage());
+                }
+                ffmpegProcess = null;
+            }
+
+            // Wait with dynamic backoff based on error type and attempt number
             long backoffTime = calculateBackoffTime(lastErrorType, restartAttempts);
             try {
                 Thread.sleep(backoffTime);
@@ -296,6 +410,7 @@ public class FFmpegController {
                 Thread.currentThread().interrupt();
             }
 
+            // Start a new process
             startFFmpegProcess();
         } else {
             LOGGER.severe("Maximum restart attempts reached. Giving up on restarting FFmpeg.");
@@ -325,11 +440,14 @@ public class FFmpegController {
         // Base backoff time (ms)
         long baseTime = 1000;
 
-        // Exponential backoff factor
+        // Exponential backoff factor with randomization to prevent thundering herd
         double factor = Math.pow(1.5, attempt - 1);
 
+        // Add jitter (0-30%)
+        double jitter = 1.0 + (Math.random() * 0.3);
+
         // Adjust based on error type
-        double typeMultiplier = 1.0;
+        double typeMultiplier;
         switch (errorType) {
             case CONNECTION_TIMEOUT:
                 typeMultiplier = 1.5; // Wait longer for timeouts
@@ -340,15 +458,15 @@ public class FFmpegController {
             case STREAM_STALLED:
                 typeMultiplier = 0.8; // Shorter for stalls
                 break;
+            case CONNECTION_REFUSED:
+                typeMultiplier = 2.0; // Wait longer for connection issues
+                break;
             default:
                 typeMultiplier = 1.0;
         }
 
-        // Calculate and apply some randomness to prevent thundering herd
-        long backoff = (long)(baseTime * factor * typeMultiplier);
-        backoff += (long)(Math.random() * 500); // Add up to 500ms of randomness
-
-        return backoff;
+        // Calculate final backoff time with jitter
+        return (long)(baseTime * factor * typeMultiplier * jitter);
     }
 
     public String getErrorSummary() {
@@ -376,8 +494,9 @@ public class FFmpegController {
         return criticalErrorDetected.get();
     }
 
-    public void stopStreaming() {
+    public boolean stopStreaming() {
         isRunning = false;
+        boolean stoppedSuccessfully = true;
 
         if (ffmpegProcess != null && ffmpegProcess.isAlive()) {
             LOGGER.info("Stopping FFmpeg process");
@@ -394,15 +513,18 @@ public class FFmpegController {
                     // Wait for forced termination
                     if (!ffmpegProcess.waitFor(2, TimeUnit.SECONDS)) {
                         LOGGER.severe("FFmpeg could not be terminated even with force!");
+                        stoppedSuccessfully = false;
                     }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 LOGGER.warning("Interrupted while waiting for FFmpeg to terminate");
                 ffmpegProcess.destroyForcibly();
+                stoppedSuccessfully = false;
             } catch (Exception e) {
                 LOGGER.severe("Error during FFmpeg shutdown: " + e.getMessage());
                 ffmpegProcess.destroyForcibly();
+                stoppedSuccessfully = false;
             }
         }
 
@@ -433,8 +555,11 @@ public class FFmpegController {
                 }
             } catch (Exception e) {
                 LOGGER.warning("Failed to clean up UDP port: " + e.getMessage());
+                stoppedSuccessfully = false;
             }
         }
+
+        return stoppedSuccessfully;
     }
 
     public boolean isRunning() {

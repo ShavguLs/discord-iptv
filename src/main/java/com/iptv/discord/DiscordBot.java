@@ -387,52 +387,81 @@ public class DiscordBot extends ListenerAdapter {
         event.deferReply().queue();
 
         Properties config = Main.loadConfig();
-
         String playlistUrl = config.getProperty("playlist.url");
         String channelName = event.getOption("channel").getAsString();
+        String guildId = event.getGuild().getId();
 
-        // Get quality option if specified
+        // Improved channel name sanitization - handle special characters
+        channelName = channelName.trim();
+
+        // Get quality option if specified (with better default handling)
         String quality = "original"; // Default to original quality
         if (event.getOption("quality") != null) {
             quality = event.getOption("quality").getAsString();
         }
 
-        String guildId = event.getGuild().getId();
-
-        // Check if we already have an active stream for this guild
+        // Check if we already have an active stream for this guild with improved error reporting
         if (activeStreams.containsKey(guildId)) {
-            event.getHook().sendMessage("A stream is already active in this server. Stop it first with `/stop`").queue();
+            StreamInfo currentStream = activeStreams.get(guildId);
+            event.getHook().sendMessage("A stream is already active in this server: `" +
+                    currentStream.channelName + "`. Stop it first with `/stop`").queue();
             return;
         }
 
         try {
-            // Parse the playlist - will use cached playlist if recently parsed
-            iptvParser.parsePlaylistFromUrl(playlistUrl);
-
-            // Find the channel
-            String streamUrl = iptvParser.getStreamUrl(channelName);
-
-            if (streamUrl == null) {
-                event.getHook().sendMessage("Channel not found: `" + channelName +
-                        "`\n\nUse `/list` to see available channels.").queue();
+            // Parse the playlist with improved error handling
+            try {
+                iptvParser.parsePlaylistFromUrl(playlistUrl);
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Error parsing IPTV playlist", e);
+                event.getHook().sendMessage("Error accessing IPTV playlist: " + e.getMessage() +
+                        "\nPlease check your playlist URL or try again later.").queue();
                 return;
             }
 
-            // Setup OBS
-            String localStreamUrl = "udp://127.0.0.1:1234";
+            // Find the channel with improved error reporting
+            String streamUrl = iptvParser.getStreamUrl(channelName);
 
-            // If quality is auto, detect the optimal quality
-            if (quality.equals("auto")) {
-                String detectedQuality = detectOptimalQuality();
-                LOGGER.info("Auto-detected quality: " + detectedQuality);
-                quality = detectedQuality;
+            if (streamUrl == null) {
+                // Enhanced error message with search suggestions
+                StringBuilder errorMsg = new StringBuilder();
+                errorMsg.append("Channel not found: `").append(channelName).append("`\n\n");
 
-                // Inform the user about the auto-detected quality
-                event.getHook().sendMessage("Auto-detected optimal quality based on network conditions: " +
-                        getQualityDisplayName(quality)).queue();
+                // Get similar channel names as suggestions
+                List<String> similarChannels = iptvParser.fuzzySearchChannels(channelName, null, 0.7);
+                if (!similarChannels.isEmpty() && similarChannels.size() <= 5) {
+                    errorMsg.append("Did you mean one of these?\n");
+                    for (String similar : similarChannels) {
+                        errorMsg.append("• `").append(similar).append("`\n");
+                    }
+                } else {
+                    errorMsg.append("Use `/search query:").append(channelName).append("` to find similar channels.\n");
+                }
+
+                event.getHook().sendMessage(errorMsg.toString()).queue();
+                return;
             }
 
-            // Define quality settings based on selected quality
+            // Setup OBS with better error handling
+            String localStreamUrl = "udp://127.0.0.1:1234";
+
+            // Handle auto quality detection with more robust error handling
+            if (quality.equals("auto")) {
+                try {
+                    String detectedQuality = detectOptimalQuality();
+                    LOGGER.info("Auto-detected quality: " + detectedQuality);
+                    quality = detectedQuality;
+
+                    // Inform user about detected quality
+                    event.getHook().sendMessage("Auto-detected optimal quality based on network conditions: " +
+                            getQualityDisplayName(quality)).queue();
+                } catch (Exception e) {
+                    LOGGER.warning("Error in quality detection, falling back to medium: " + e.getMessage());
+                    quality = "medium";  // Safe fallback
+                }
+            }
+
+            // Define quality settings with more robust defaults
             String qualityOptions = "";
             if (!quality.equals("original")) {
                 switch (quality) {
@@ -448,22 +477,45 @@ public class DiscordBot extends ListenerAdapter {
                     case "audio-only":
                         qualityOptions = "-vn -c:a aac -b:a 128k";
                         break;
+                    default:
+                        // Handle unexpected quality value
+                        LOGGER.warning("Unexpected quality value: " + quality + ", defaulting to medium");
+                        quality = "medium";
+                        qualityOptions = "-vf scale=1280:-1 -c:v libx264 -preset medium -b:v 2M -maxrate 2M -bufsize 4M -c:a aac -b:a 128k";
+                        break;
                 }
             }
 
-            // Start FFmpeg with quality options if specified
+            // Start FFmpeg with improved error handling and retries
             boolean success;
-            if (quality.equals("original")) {
-                // Use the original method for original quality to maintain compatibility
-                success = ffmpegController.startStreaming(streamUrl, localStreamUrl);
-            } else {
-                // Use the new quality-aware method
-                success = ffmpegController.startStreamingWithQuality(streamUrl, localStreamUrl, qualityOptions);
-            }
+            int retryCount = 0;
+            final int MAX_START_RETRIES = 2;
 
+            do {
+                if (quality.equals("original")) {
+                    success = ffmpegController.startStreaming(streamUrl, localStreamUrl);
+                } else {
+                    success = ffmpegController.startStreamingWithQuality(streamUrl, localStreamUrl, qualityOptions);
+                }
+
+                if (!success && retryCount < MAX_START_RETRIES) {
+                    LOGGER.info("Stream start failed, retrying (attempt " + (retryCount + 1) + "/" + MAX_START_RETRIES + ")");
+                    // Brief pause before retry
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    retryCount++;
+                } else {
+                    break;
+                }
+            } while (retryCount < MAX_START_RETRIES);
+
+            // If still not successful after retries, try fallback
             if (!success) {
                 // Try a fallback URL if available
-                LOGGER.info("Primary stream failed, attempting fallback");
+                LOGGER.info("Primary stream failed after " + MAX_START_RETRIES + " attempts, trying fallback");
                 String fallbackUrl = iptvParser.getFallbackStreamUrl(channelName);
 
                 if (fallbackUrl != null && !fallbackUrl.equals(streamUrl)) {
@@ -497,27 +549,47 @@ public class DiscordBot extends ListenerAdapter {
                 }
             }
 
-            // Configure OBS to display the stream
+            // Configure OBS to display the stream with better error handling
             if (!obsController.setupStream(localStreamUrl, channelName)) {
-                ffmpegController.stopStreaming();
-                event.getHook().sendMessage("Failed to configure OBS. Please ensure OBS is running with WebSocket plugin enabled.").queue();
-                return;
+                // Try to reconnect to OBS if setup fails
+                LOGGER.warning("OBS setup failed, attempting to reconnect...");
+                boolean reconnected = obsController.connect();
+
+                // Try setup again if reconnection was successful
+                boolean obsSuccess = reconnected && obsController.setupStream(localStreamUrl, channelName);
+
+                if (!obsSuccess) {
+                    ffmpegController.stopStreaming();
+                    event.getHook().sendMessage("Failed to configure OBS. Please ensure OBS is running with WebSocket plugin enabled.").queue();
+                    return;
+                }
             }
 
-            // Store active stream info with enhanced details and quality setting
-            StreamInfo streamInfo = new StreamInfo(playlistUrl, channelName, streamUrl, event.getChannel().getId(), quality);
+            // Store active stream info with more details
+            StreamInfo streamInfo = new StreamInfo(
+                    playlistUrl,
+                    channelName,
+                    streamUrl,
+                    event.getChannel().getId(),
+                    quality,
+                    quality.equals("auto") ? "auto" : quality, // Track auto setting separately
+                    System.currentTimeMillis()
+            );
             activeStreams.put(guildId, streamInfo);
 
-            // Get additional channel info if available
+            // Get additional channel info with error handling
             String channelGroup = iptvParser.getChannelGroup(channelName);
-            List<String> similarChannels = iptvParser.getSimilarChannels(channelName);
+            List<String> similarChannels = Collections.emptyList();
+            try {
+                similarChannels = iptvParser.getSimilarChannels(channelName);
+            } catch (Exception e) {
+                LOGGER.warning("Error getting similar channels: " + e.getMessage());
+            }
 
-            // Build success message with additional information
+            // Build comprehensive success message
             StringBuilder successMessage = new StringBuilder();
             successMessage.append("📺 **IPTV Stream started**\n\n");
             successMessage.append("**Channel:** ").append(channelName).append("\n");
-
-            // Include quality information
             successMessage.append("**Quality:** ").append(getQualityDisplayName(quality)).append("\n");
 
             if (channelGroup != null && !channelGroup.isEmpty()) {
@@ -545,12 +617,19 @@ public class DiscordBot extends ListenerAdapter {
 
             event.getHook().sendMessage(successMessage.toString()).queue();
 
-            // Start monitoring thread for this stream
-            startStreamMonitoring(guildId, event.getChannel());
+            // Start monitoring thread with error handling
+            try {
+                startStreamMonitoring(guildId, event.getChannel());
 
-        } catch (IOException e) {
-            LOGGER.log(Level.SEVERE, "Error parsing playlist", e);
-            event.getHook().sendMessage("Error: " + e.getMessage()).queue();
+                // If auto quality, also start quality monitoring
+                if (quality.equals("auto")) {
+                    startQualityMonitoring(guildId, event.getChannel());
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error starting stream monitoring", e);
+                // Continue anyway, as the stream is already running
+            }
+
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Unexpected error", e);
             event.getHook().sendMessage("Unexpected error: " + e.getMessage()).queue();
@@ -654,7 +733,11 @@ public class DiscordBot extends ListenerAdapter {
         StreamInfo streamInfo = activeStreams.get(guildId);
 
         // Stop FFmpeg
-        ffmpegController.stopStreaming();
+        boolean stopped = ffmpegController.stopStreaming();
+        if (!stopped) {
+            LOGGER.warning("FFmpeg didn't stop cleanly during clean stream stop, forcing cleanup");
+            ffmpegController.cleanupAllProcesses();
+        }
 
         // Remove from tracking
         activeStreams.remove(guildId);
@@ -686,9 +769,18 @@ public class DiscordBot extends ListenerAdapter {
             StreamInfo removedStream = activeStreams.get(guildId);
             String channelName = removedStream.channelName;
 
-            // Stop FFmpeg first
+            // Stop all monitoring first
+            stopStreamMonitoring(guildId);
+            stopQualityMonitoring(guildId);
+
+            // Stop FFmpeg
             LOGGER.info("Stopping FFmpeg for channel: " + channelName);
-            ffmpegController.stopStreaming();
+            boolean ffmpegStopped = ffmpegController.stopStreaming();
+
+            if (!ffmpegStopped) {
+                LOGGER.warning("FFmpeg didn't stop cleanly, forcing cleanup");
+                ffmpegController.cleanupAllProcesses();
+            }
 
             // Remove the stream from our tracking
             activeStreams.remove(guildId);
@@ -700,24 +792,35 @@ public class DiscordBot extends ListenerAdapter {
                 Thread.currentThread().interrupt();
             }
 
-            // Clean up OBS sources
+            // Clean up OBS sources with improved error handling
+            boolean obsCleanupSuccess = false;
             try {
                 // Get a sanitized version of the channel name that matches what we used to create it
                 String safeName = channelName.replaceAll("[^a-zA-Z0-9]", "_");
                 String sourceName = "IPTV-Source-" + safeName;
 
                 // Try to clean up any sources with this name pattern
-                // This will include both the base name and any timestamped variants
-                obsController.cleanupSources(sourceName);
+                int removedSources = obsController.cleanupSources(sourceName);
+                LOGGER.info("Removed " + removedSources + " OBS sources");
+                obsCleanupSuccess = true;
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Error cleaning up OBS sources", e);
                 // Continue anyway as we've already stopped FFmpeg
             }
 
-            event.getHook().sendMessage("Stopped streaming: " + channelName).queue();
+            // Provide more information in the response
+            StringBuilder response = new StringBuilder();
+            response.append("Stopped streaming: ").append(channelName);
+
+            if (!obsCleanupSuccess) {
+                response.append("\n⚠️ Note: Had trouble cleaning up OBS sources. You may want to run `/cleanup` later.");
+            }
+
+            event.getHook().sendMessage(response.toString()).queue();
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error stopping stream", e);
-            event.getHook().sendMessage("Error stopping stream: " + e.getMessage()).queue();
+            event.getHook().sendMessage("Error stopping stream: " + e.getMessage() +
+                    "\nThe stream may still be active. Try the command again or restart the bot if issues persist.").queue();
         }
     }
 
@@ -747,28 +850,67 @@ public class DiscordBot extends ListenerAdapter {
     }
 
     public void shutdown() {
-        // Stop all stream monitoring
+        LOGGER.info("Starting Discord bot shutdown sequence");
+
+        // First stop all stream monitoring
+        LOGGER.info("Stopping all stream monitoring (" + streamMonitors.size() + " active monitors)");
         for (String guildId : new ArrayList<>(streamMonitors.keySet())) {
             stopStreamMonitoring(guildId);
         }
 
+        // Also stop quality monitors if any
+        LOGGER.info("Stopping all quality monitoring (" + qualityMonitors.size() + " active monitors)");
+        for (String guildId : new ArrayList<>(qualityMonitors.keySet())) {
+            stopQualityMonitoring(guildId);
+        }
+
         // Stop all active streams
+        LOGGER.info("Stopping all active streams (" + activeStreams.size() + " active streams)");
         for (StreamInfo streamInfo : activeStreams.values()) {
-            ffmpegController.stopStreaming();
+            LOGGER.info("Stopping stream: " + streamInfo.channelName);
+            boolean stopped = ffmpegController.stopStreaming();
+            if (!stopped) {
+                LOGGER.warning("FFmpeg didn't stop cleanly during shutdown, continuing cleanup");
+            }
+
+            // Cleanup OBS sources
+            try {
+                String safeName = streamInfo.channelName.replaceAll("[^a-zA-Z0-9]", "_");
+                String sourceName = "IPTV-Source-" + safeName;
+                obsController.cleanupSources(sourceName);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error cleaning up OBS sources during shutdown", e);
+            }
         }
         activeStreams.clear();
 
         // Disconnect from OBS
+        LOGGER.info("Disconnecting from OBS");
         obsController.disconnect();
 
-        // Shutdown FFmpeg controller
+        // Shutdown FFmpeg controller with explicit cleanup
+        LOGGER.info("Shutting down FFmpeg controller");
+        ffmpegController.cleanupAllProcesses(); // More thorough than just shutdown()
         ffmpegController.shutdown();
 
         // Shutdown the IPTV parser
+        LOGGER.info("Shutting down IPTV parser");
         iptvParser.shutdown();
 
-        // Shutdown JDA
-        jda.shutdown();
+        // Shutdown JDA with a timeout
+        LOGGER.info("Shutting down JDA");
+        try {
+            jda.shutdown();
+            // Wait for JDA to finish shutting down
+            if (!jda.awaitShutdown(10, TimeUnit.SECONDS)) {
+                LOGGER.warning("JDA did not shut down in time, forcing shutdown");
+            }
+        } catch (InterruptedException e) {
+            LOGGER.warning("Interrupted while waiting for JDA shutdown");
+            Thread.currentThread().interrupt();
+        }
+
+        LOGGER.info("Discord bot shutdown complete");
     }
 
     private void handleHealthCheckCommand(SlashCommandInteractionEvent event) {
